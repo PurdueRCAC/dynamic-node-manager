@@ -1,0 +1,327 @@
+#!/bin/bash
+set -Eeuo pipefail
+
+CONVERT_TO=""
+NODE_NAME=""
+NODE_TYPE=""
+NUM_NODES=""
+NAMESPACE=""
+SET_K8S="/usr/site/rcac/sbin/k8s-convert"
+
+# Discover default search domain for FQDN pings (may be empty)
+NODE_SEARCH_DOMAIN="${NODE_SEARCH_DOMAIN:-$(hostname -d 2>/dev/null || true)}"
+
+RES_NAME="k8s"
+RES_USERS="root"
+RES_ACCOUNTS="root"
+
+usage() {
+    cat <<EOF
+Usage: $0 --set <k8s|batch> [--node-name <name> | (--node-type a|b|g --num-nodes <num>)] [--namespace <ns>]
+
+    --set         k8s | batch   (required)
+    --node-name   Convert a single node by name
+    --node-type   Node type prefix (a|b|g) to select from (required with --num-nodes)
+    --num-nodes   Number of nodes to convert (required with --node-type)
+    --namespace   Namespace tag to apply on converted nodes (label/taint as <ns>=true)
+    --help        This message
+EOF
+    exit 1
+}
+
+mark_node() {
+    local node="$1"
+    echo "Marking $node"
+    /usr/site/rcac/scripts/marknode -n "$node" -c "batch node selected for k8s conversion"
+}
+
+is_node_reachable() {
+    local node="$1"
+    echo "PING CHECK (short): $node"
+    if ping -c1 -W1 -q "$node" >/dev/null 2>&1; then
+        echo "PING OK (short): $node"
+        return 0
+    fi
+    if [[ -n "$NODE_SEARCH_DOMAIN" ]]; then
+        local fqdn="${node}.${NODE_SEARCH_DOMAIN}"
+        echo "PING CHECK (fqdn): $fqdn"
+        if ping -c1 -W1 -q "$fqdn" >/dev/null 2>&1; then
+            echo "PING OK (fqdn): $fqdn"
+            return 0
+        fi
+    fi
+    echo "PING FAIL: $node"
+    return 1
+}
+
+# ---------------- Slurm reservation helpers ----------------
+
+res_exists() {
+    /usr/bin/scontrol show reservation "$RES_NAME" >/dev/null 2>&1
+}
+
+res_get_nodes_hostlist() {
+    /usr/bin/scontrol show reservation "$RES_NAME" 2>/dev/null \
+      | awk -F'=' '/Nodes=/{print $2}' | awk '{print $1}' | head -n1
+}
+
+res_get_nodes_expanded() {
+    local hostlist
+    hostlist="$(res_get_nodes_hostlist || true)"
+    if [[ -z "${hostlist:-}" ]]; then
+        return 0
+    fi
+    /usr/bin/scontrol show hostnames "$hostlist"
+}
+
+res_set_nodes_from_array() {
+    local nodes=("$@")
+    if ((${#nodes[@]} == 0)); then
+        echo "Reservation $RES_NAME would be empty; deleting it."
+        /usr/bin/scontrol delete reservation "$RES_NAME"
+        return 0
+    fi
+
+    mapfile -t uniq_sorted < <(printf "%s\n" "${nodes[@]}" | awk 'NF' | sort -u)
+
+    # join with commas just cause
+    local csv
+    csv="$(IFS=, ; echo "${uniq_sorted[*]}")"
+
+    # compress with hostlist that already exists
+    local compressed
+    compressed="$(/usr/bin/scontrol show hostlist "$csv")"
+
+    echo "Updating reservation $RES_NAME nodes to: $compressed"
+    /usr/bin/scontrol update ReservationName="$RES_NAME" Nodes="$compressed" Users="$RES_USERS" Accounts="$RES_ACCOUNTS"
+}
+
+res_create_with_nodes() {
+    local nodes_csv="$1"
+    echo "Creating reservation $RES_NAME with nodes: $nodes_csv"
+    /usr/bin/scontrol create reservation \
+        ReservationName="$RES_NAME" \
+        StartTime=now Duration=INFINITE \
+        Users=root Accounts=root \
+        Nodes="$nodes_csv"
+}
+
+
+res_add_nodes() {
+    set -e
+
+    local add_nodes=("$@")
+
+    if ! res_exists; then
+        # Create with provided nodes
+        local csv
+        csv="$(IFS=, ; echo "${add_nodes[*]}")"
+        res_create_with_nodes "$csv" || {
+            echo "Failed to create resource with nodes." >&2
+            kill $$
+        }
+        return
+    fi
+
+    # Merge with existing
+    mapfile -t existing < <(res_get_nodes_expanded || true)
+    local merged=("${existing[@]}" "${add_nodes[@]}")
+
+    res_set_nodes_from_array "${merged[@]}" || {
+        echo "Failed to set nodes from array." >&2
+        kill $$
+    }
+}
+
+
+res_remove_nodes() {
+    # Remove nodes given as args; delete reservation if empty afterwards
+    local del=("$@")
+    if ! res_exists; then
+        echo "Reservation $RES_NAME does not exist; nothing to remove."
+        return 0
+    fi
+    mapfile -t existing < <(res_get_nodes_expanded || true)
+
+    # If reservation has no nodes, delete it
+    if ((${#existing[@]} == 0)); then
+        echo "Reservation $RES_NAME has no nodes; deleting."
+        /usr/bin/scontrol delete reservation "$RES_NAME"
+        return 0
+    fi
+
+    declare -A to_del=()
+    for n in "${del[@]}"; do to_del["$n"]=1; done
+
+    new_list=()
+    for n in "${existing[@]}"; do
+        if [[ -z "${to_del[$n]:-}" ]]; then
+            new_list+=("$n")
+        fi
+    done
+
+    if ((${#new_list[@]} == 0)); then
+        echo "Last node(s) removed; deleting reservation $RES_NAME."
+        /usr/bin/scontrol delete reservation "$RES_NAME"
+    else
+        res_set_nodes_from_array "${new_list[@]}"
+    fi
+}
+
+# -----------------------------------------------------------
+
+# -------- arg parsing --------
+while [[ $# -gt 0 ]]; do
+    key="$1"
+    case $key in
+        --set)        CONVERT_TO="$2"; shift 2 ;;
+        --node-name)  NODE_NAME="$2";  shift 2 ;;
+        --node-type)  NODE_TYPE="$2";  shift 2 ;;
+        --num-nodes)  NUM_NODES="$2";  shift 2 ;;
+        --namespace)  NAMESPACE="$2";  shift 2 ;;
+        --help)       usage ;;
+        *)            usage ;;
+    esac
+done
+[[ -z "$CONVERT_TO" ]] && usage
+
+if [[ -n "$NODE_NAME" && ( -n "$NODE_TYPE" || -n "$NUM_NODES" ) ]]; then
+    echo "Error: If --node-name is selected, the other two parameters cannot be selected." >&2
+    usage
+fi
+
+if [[ -n "$NODE_TYPE" && -z "$NUM_NODES" ]] || [[ -z "$NODE_TYPE" && -n "$NUM_NODES" ]]; then
+    echo "Error: Both --node-type and --num-nodes must be provided together." >&2
+    usage
+fi
+# -----------------------------
+
+case $CONVERT_TO in
+    k8s )
+        # Multi-node
+        if [[ -z "$NODE_NAME" ]]; then
+            mapfile -t candidates < <(
+                /usr/bin/scontrol --oneliner show nodes \
+                | awk -F'[ =]' -v node_type="$NODE_TYPE" '
+                    /State=IDLE/ && $0 !~ /\+DRAIN/ && $2 ~ ("^" node_type) { print $2 }'
+            )
+
+            if ((${#candidates[@]} == 0)); then
+                echo "No eligible idle nodes of type '${NODE_TYPE}' found" >&2
+                exit 1
+            fi
+
+            reachable=()
+            for n in "${candidates[@]}"; do
+                if is_node_reachable "$n"; then
+                    echo "PING PASS: selecting $n"
+                    reachable+=("$n")
+                    if ((${#reachable[@]} >= NUM_NODES)); then
+                        break
+                    fi
+                else
+                    echo "PING SKIP: $n not reachable"
+                fi
+            done
+
+            if ((${#reachable[@]} < NUM_NODES)); then
+                echo "Only found ${#reachable[@]} reachable nodes (requested ${NUM_NODES})" >&2
+                exit 1
+            fi
+
+            printf "%s\n" "${reachable[@]}"
+            for node in "${reachable[@]}"; do
+                mark_node "$node"
+            done
+
+            IFS=, read -r -a _tmp <<< "${reachable[*]}"; nodes_csv="${_tmp[*]}"; unset _tmp
+
+            # ---- reservation: add nodes ----
+            res_add_nodes "${reachable[@]}"
+
+            # Pass namespace via env so k8s-convert/k8s-register can use it
+            pdsh -w "$nodes_csv" "env NAMESPACE='${NAMESPACE}' $SET_K8S"
+            rc=$?
+            if (( rc != 0 )); then
+                echo "pdsh failed with rc=$rc" >&2
+                exit $rc
+            fi
+            for node in "${reachable[@]}"; do
+                echo "$node"
+            done
+
+        # Single node
+        else
+            if ! /usr/bin/scontrol show node "$NODE_NAME" | grep -q 'State=IDLE '; then
+                echo "$NODE_NAME is not in IDLE state. Please pick another node." >&2
+                exit 1
+            fi
+            if ! is_node_reachable "$NODE_NAME"; then
+                echo "$NODE_NAME is not reachable (ping failed). Please pick another node." >&2
+                exit 1
+            fi
+            echo "PING PASS: selecting $NODE_NAME"
+            mark_node "$NODE_NAME"
+
+            # ---- reservation: add node ----
+            res_add_nodes "$NODE_NAME"
+            pdsh -w "$NODE_NAME" "env NAMESPACE='${NAMESPACE}' $SET_K8S"
+            rc=$?
+            if (( rc != 0 )); then
+                echo "pdsh failed with rc=$rc for $NODE_NAME" >&2
+                exit $rc
+            fi
+
+
+
+            echo "$NODE_NAME"
+        fi
+    ;;
+    batch )
+        # Multi-node
+        if [[ -z "$NODE_NAME" ]]; then
+            mapfile -t nodes < <(
+                kubectl get nodes --no-headers \
+                | awk -v nt="$NODE_TYPE" '$1 ~ "^" nt "[0-9]{3}$" {print $1}' \
+                | shuf -n "${NUM_NODES}"
+            )
+
+            if ((${#nodes[@]} == 0)); then
+                echo "No nodes matched type '${NODE_TYPE}'" >&2
+                exit 1
+            fi
+
+            echo "Converting these nodes back to batch: ${nodes[*]}"
+
+            kubectl drain --ignore-daemonsets --delete-emptydir-data --force "${nodes[@]}"
+            kubectl delete node "${nodes[@]}"
+
+            for node in "${nodes[@]}"; do
+                ssh mgmt /opt/dell/srvadmin/sbin/racadm -r "${node}.iron" --nocertwarn -u root -p "$PASSWORD" serveraction powercycle \
+                && echo "Server power operation initiated successfully for ${node}"
+                echo "SLURM RESUME: /usr/bin/scontrol update nodename=${node} state=resume"
+                /usr/bin/scontrol update "nodename=${node}" state=resume
+            done
+
+            # ---- reservation: remove nodes (and delete res if last) ----
+            res_remove_nodes "${nodes[@]}"
+
+        # Single node
+        else
+            kubectl drain --ignore-daemonsets --delete-emptydir-data --force "$NODE_NAME"
+            kubectl delete node "$NODE_NAME"
+            echo "Converting $NODE_NAME back to batch"
+            ssh mgmt /opt/dell/srvadmin/sbin/racadm -r "${NODE_NAME}.iron" --nocertwarn -u root -p "$PASSWORD" serveraction powercycle \
+            && echo "Server power operation initiated successfully for ${NODE_NAME}"
+            echo "SLURM RESUME: /usr/bin/scontrol update nodename=${NODE_NAME} state=resume"
+            /usr/bin/scontrol update "nodename=${NODE_NAME}" state=resume
+            /usr/bin/scontrol update "nodename=${NODE_NAME}" Reason="k8s-node reverted back to batch; ready for use."
+
+            # ---- reservation: remove node (and delete res if last) ----
+            res_remove_nodes "$NODE_NAME"
+        fi
+    ;;
+    * )
+        usage
+    ;;
+esac
