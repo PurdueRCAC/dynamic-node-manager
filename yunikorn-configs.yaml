@@ -1,0 +1,40 @@
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: yunikorn-configs
+  namespace: yunikorn
+data:
+  queues.yaml: |
+    partitions:
+      - name: default
+        nodesortpolicy:
+          type: binpacking
+        queues:
+        - name: anvil
+          queues:
+          - name: services
+            queues:
+            - name: notebook
+              submitacl: '*'
+              resources:
+                guaranteed:
+                  memory: 256G
+                  vcore: 128
+                max:
+                  memory: 512G
+                  vcore: 256
+              properties:
+                priority.offset: 0
+                preemption.delay: 5s
+            - name: dev
+              submitacl: '*'
+              resources:
+                guaranteed:
+                  memory: 32G
+                  vcore: 8
+                max:
+                  memory: 320G
+                  vcore: 80
+              properties:
+                priority.offset: 0
+                preemption.delay: 5s
