@@ -1,0 +1,15 @@
+[Unit]
+Description=Dynamic Kubernetes Node Manager
+After=multi-user.target network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/usr/site/rcac/sbin
+# Explicitly run monitor mode so argparse knows what to do
+ExecStart=/usr/bin/python3 /usr/site/rcac/sbin/dynamic-node-manager.py --mode monitor
+Restart=on-failure
+RestartSec=5
+Environment=PYTHONUNBUFFERED=1
+
+[Install]
+WantedBy=multi-user.target
