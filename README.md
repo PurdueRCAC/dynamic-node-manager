@@ -145,6 +145,145 @@ Continuously:
 - `/usr/site/rcac/sbin/node-convert`  
   Used to convert nodes between Slurm batch and Kubernetes.
 
+#### Checking viability without converting
+
+```
+node-convert --list                     # every Slurm node
+node-convert --list --node-type a       # only 'a' nodes
+node-convert --list --node-name a001    # one node
+```
+
+Read-only: it runs the exact same eligibility logic the conversion path uses and
+prints a verdict per node, so you can see *why* a node was rejected.
+
+```
+NODE             STATE                            IDLE  VERDICT REASON
+a001             IDLE                           12h40m  OK      -
+a008             ALLOCATED                          0s  PREEMPT job 6000001 (x-ob/pur230002) running 1h0m
+a009             ALLOCATED                          0s  PREEMPT job 6000001 (x-ob/pur230002) running 1h0m
+a006             IDLE                            4d14h  SKIP    reservation maint_sep
+a007             IDLE                            2d14h  SKIP    planned for pending job 5510003
+a003             IDLE+DRAIN                       1d5h  SKIP    state flag DRAIN
+a002             IDLE+PLANNED                    5h40m  SKIP    state flag PLANNED
+a004             ALLOCATED                         40m  SKIP    not idle (ALLOCATED)
+a005             IDLE                              30s  SKIP    idle only 30s (< 600s)
+a010             ALLOCATED                          0s  SKIP    not idle (ALLOCATED)
+
+Viable now: 1 of 10 node(s) matching prefix 'a'
+Preemptible: 2 node(s) held by x-ob/pur230002
+```
+
+`OK` = usable right now. `PREEMPT` = busy, but the job holding it is preemptible
+backfill. `SKIP` = off limits, with the reason.
+
+#### Preempting backfill jobs when nothing is idle
+
+When fewer nodes are viable than requested, `--allow-preempt` lets `node-convert`
+free some by preempting jobs that match *both* `PREEMPT_USER` and
+`PREEMPT_ACCOUNT` (default `x-ob` / `pur230002`). Nothing else is ever touched,
+and preemption is off unless explicitly enabled.
+
+These jobs are single-node by construction, and the script enforces that rather
+than assuming it: a matching job spanning more than one node is reported and
+skipped, never preempted. Killing a 4-node job to satisfy a 1-node request would
+destroy four nodes' worth of work. `--list` names the job and its node count so
+the skip is visible.
+
+```
+node-convert --set k8s --node-type a --num-nodes 2 --allow-preempt
+```
+
+Order of operations, which matters:
+
+1. Pick the **youngest** matching jobs first, so the least compute is lost.
+   `PREEMPT_MAX_RUNTIME_SECONDS` additionally protects jobs past a given age.
+2. Skip jobs that span more than one node or whose node is outside the requested
+   type, and ping-check the node *before* destroying any work.
+3. Add the nodes to the `k8s` reservation **first** (with `IGNORE_JOBS`, which
+   allows reserving a busy node). Without this, the scheduler can hand the node
+   to another job in the gap between the job exiting and `k8s-convert` running.
+4. `SIGTERM` the job, wait `PREEMPT_GRACE_SECONDS`, then requeue it
+   (`PREEMPT_MODE=requeue`, the default) or cancel it (`PREEMPT_MODE=cancel`).
+   A job with `Requeue=0` is skipped rather than killed, unless mode is `cancel`.
+5. Wait for the node to leave `COMPLETING` and reach `IDLE`, then convert.
+6. If the conversion aborts anyway (too few reachable nodes), release the
+   preempted nodes from the reservation. Otherwise they sit reserved and
+   unschedulable with nothing running on them.
+
+If `PROTECT_LARGEST_PENDING=1` trips, no preemption is attempted either: a
+starved large job should not be made worse.
+
+Consider whether Slurm's native preemption (a preemptible QOS or partition plus
+`PreemptMode=REQUEUE`) fits better. It is the supported mechanism and it lets the
+scheduler make the choice; this flag exists for the case where those jobs are a
+convention rather than a configured QOS.
+
+#### Node eligibility (batch → k8s)
+
+A Slurm node is only taken if **all** of these hold:
+
+- base state is `IDLE` with no `PLANNED`, `RESERVED`, `DRAIN*`, `DOWN`, `FAIL*`,
+  `MAINT`, `REBOOT_*`, `POWER*`, `NOT_RESPONDING`, `INVALID_REG` or `COMPLETING` flag
+- `LastBusyTime` is at least `MIN_IDLE_SECONDS` ago
+- the node is not listed in `SchedNodes` of any pending job (i.e. the backfill
+  scheduler has not already earmarked it for a job that is waiting to start)
+- the node is not in a reservation that is active or starts within
+  `RES_LOOKAHEAD_SECONDS` (the `k8s` reservation itself is excluded)
+
+Candidates are sorted longest-idle first. After the node joins the `k8s`
+reservation its state is re-checked, and reservation membership is rolled back
+if Slurm allocated it in the meantime.
+
+Environment overrides:
+
+- `MIN_IDLE_SECONDS` (default `600`)
+- `RES_LOOKAHEAD_SECONDS` (default `86400`)
+- `PROTECT_LARGEST_PENDING` (default `0`, disabled) — when set to `1`, refuse to
+  convert if doing so would leave fewer eligible idle nodes than the largest
+  pending job requests.
+- `PREEMPT_ENABLED` (default `0`) — same as passing `--allow-preempt`.
+- `PREEMPT_USER` / `PREEMPT_ACCOUNT` (default `x-ob` / `pur230002`) — a job must
+  match both to be preemptible.
+- `PREEMPT_MODE` (default `requeue`) — `requeue` or `cancel`.
+- `PREEMPT_GRACE_SECONDS` (default `60`) — `SIGTERM` first, then wait this long.
+- `PREEMPT_MAX_RUNTIME_SECONDS` (default `0`, no limit) — never preempt a job
+  that has run longer than this.
+- `PREEMPT_DRAIN_TIMEOUT` (default `300`) — how long to wait for a preempted
+  node to reach `IDLE`.
+- `PASSWORD` (no default, **required for `--set batch`**) — the racadm password
+  used to power cycle a node on its way back to Slurm. `--set batch` refuses to
+  start without it, before anything is drained.
+
+Note: the `PLANNED` node state requires Slurm 22.05 or newer; on older versions
+the `SchedNodes` check carries most of the weight.
+
+### Failure handling
+
+Every external command (`scontrol`, `squeue`, `kubectl`, `pdsh`, `ssh`/racadm)
+is checked, and the script is built so that a failure never leaves a node in
+neither pool:
+
+- If Slurm or Kubernetes cannot be queried, nothing is converted. A node is
+  never judged viable on the strength of a query that failed — an unreadable
+  pending queue would otherwise make backfill-planned nodes look idle.
+- The `k8s` reservation is never rewritten from a membership list that could not
+  be read, and it is never deleted just because reading it failed.
+- If `pdsh` fails part way through, the affected nodes stay drained and in the
+  reservation (and so out of Slurm's reach) and the script names them, rather
+  than handing half-converted machines back to the batch scheduler.
+- Selected nodes are drained with a `Reason` (`MARK_REASON`, default `batch node
+  selected for k8s conversion`) so `sinfo -R` explains why they left the batch
+  pool — a reservation carries no per-node note of its own, and Slurm only keeps
+  a `Reason` on a node that is out of service. Any rollback that releases the
+  reservation also clears the drain — otherwise the node would be neither
+  reserved nor schedulable, and `DRAIN` would keep it out of future selection
+  too.
+- On the way back to batch, each step gates the next: a node that could not be
+  drained is not deleted, and a node that could not be power cycled is not
+  resumed in Slurm and keeps its reservation. In a multi-node revert the nodes
+  that succeeded are released normally and the failures are listed; the exit
+  status is non-zero if any node failed.
+
 ---
 
 ## Configuration
@@ -163,6 +302,9 @@ Expected keys (section `[settings]`):
   Evaluate loop interval.
 - `max_converted_nodes`  
   Global cap on how many nodes may be converted at any time.
+- `allow_preempt` (default `false`)  
+  Passes `--allow-preempt` to `node-convert`, letting it preempt single-node
+  backfill jobs when no node is idle. See the `node-convert` section above.
 - `yunikorn_cm_namespace` (default: `yunikorn`)  
   Namespace containing the YuniKorn ConfigMap.
 - `yunikorn_cm_name` (default: `yunikorn-configs`)  
