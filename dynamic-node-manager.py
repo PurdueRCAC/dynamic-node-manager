@@ -143,6 +143,15 @@ class DynamicNodeManager:
             config_data.get("settings", "default_mem_request", fallback="2Gi")
         )
         self.default_mem_request_bytes = self.parse_mem_quantity(self.default_mem_request)
+        # When set, node-convert may preempt single-node backfill jobs (see its
+        # PREEMPT_* settings) if no node is idle. Off unless explicitly enabled.
+        self.allow_preempt = str(
+            config_data.get("settings", "allow_preempt", fallback="false")
+        ).strip().lower() in ("1", "true", "yes", "on")
+        if self.allow_preempt:
+            logger.warning(
+                "allow_preempt is enabled: conversions may preempt running batch jobs"
+            )
 
     # Scans live Kubernetes nodes and counts which ones look "converted" into a namespace pool.
     # Returns: (total_converted, per_namespace_breakdown).
@@ -544,6 +553,8 @@ class DynamicNodeManager:
                 "--namespace",
                 namespace,
             ]
+            if self.allow_preempt:
+                cmd.append("--allow-preempt")
             logger.info("Running: %s", " ".join(cmd))
             p = subprocess.Popen(
                 cmd,

@@ -27,6 +27,24 @@ PROTECT_LARGEST_PENDING="${PROTECT_LARGEST_PENDING:-0}"
 # Slurm state flags that disqualify an otherwise-IDLE node.
 EXCLUDE_STATE_FLAGS="DRAIN|DRAINING|DRAINED|DOWN|FAIL|FAILING|MAINT|PLANNED|RESERVED|REBOOT_REQUESTED|REBOOT_ISSUED|POWER_DOWN|POWERING_DOWN|POWERING_UP|POWERED_DOWN|NOT_RESPONDING|INVALID_REG|COMPLETING"
 
+# ---------------- Preemption tuning ----------------
+# Whole-node backfill jobs that may be preempted when nothing is idle. Only jobs
+# matching BOTH the user and the account are ever touched.
+PREEMPT_USER="${PREEMPT_USER:-x-ob}"
+PREEMPT_ACCOUNT="${PREEMPT_ACCOUNT:-pur230002}"
+# requeue = put the job back in the queue to run again later (default)
+# cancel  = kill it outright
+PREEMPT_MODE="${PREEMPT_MODE:-requeue}"
+# SIGTERM the job and wait this long before requeue/cancel. 0 disables.
+PREEMPT_GRACE_SECONDS="${PREEMPT_GRACE_SECONDS:-60}"
+# Never preempt a job that has already run longer than this (0 = no limit).
+# Youngest jobs are preempted first, so this protects long-running work.
+PREEMPT_MAX_RUNTIME_SECONDS="${PREEMPT_MAX_RUNTIME_SECONDS:-0}"
+# How long to wait for a preempted node to return to IDLE.
+PREEMPT_DRAIN_TIMEOUT="${PREEMPT_DRAIN_TIMEOUT:-300}"
+# Preemption is opt-in per invocation: --allow-preempt or PREEMPT_ENABLED=1.
+ALLOW_PREEMPT="${PREEMPT_ENABLED:-0}"
+
 usage() {
     cat <<EOF
 Usage: $0 --set <k8s|batch> [--node-name <name> | (--node-type a|b|g --num-nodes <num>)] [--namespace <ns>]
@@ -39,6 +57,9 @@ Usage: $0 --set <k8s|batch> [--node-name <name> | (--node-type a|b|g --num-nodes
     --namespace   Namespace tag to apply on converted nodes (label/taint as <ns>=true)
     --list        Read-only: show which Slurm nodes are viable for conversion and
                   why the rest are not. Changes nothing.
+    --allow-preempt
+                  When too few nodes are idle, preempt single-node backfill jobs
+                  owned by ${PREEMPT_USER}/${PREEMPT_ACCOUNT} to free some. Off by default.
     --help        This message
 
 Environment overrides (both modes):
@@ -47,6 +68,15 @@ Environment overrides (both modes):
                              blocking (default 86400)
     PROTECT_LARGEST_PENDING  1 = refuse to convert if it would leave fewer viable
                              nodes than the largest pending job needs (default 0)
+
+Preemption (only with --allow-preempt or PREEMPT_ENABLED=1):
+    PREEMPT_USER             Job owner eligible for preemption (default x-ob)
+    PREEMPT_ACCOUNT          Account eligible for preemption (default pur230002)
+    PREEMPT_MODE             requeue (default) | cancel
+    PREEMPT_GRACE_SECONDS    SIGTERM then wait this long before acting (default 60)
+    PREEMPT_MAX_RUNTIME_SECONDS
+                             Never preempt a job running longer than this (0 = no limit)
+    PREEMPT_DRAIN_TIMEOUT    Seconds to wait for a preempted node to go IDLE (default 300)
 EOF
     exit 1
 }
@@ -83,8 +113,11 @@ res_exists() {
 }
 
 res_get_nodes_hostlist() {
-    /usr/bin/scontrol show reservation "$RES_NAME" 2>/dev/null \
-      | awk -F'=' '/Nodes=/{print $2}' | awk '{print $1}' | head -n1
+    # Must match the Nodes= key specifically. Splitting the whole record on '='
+    # and taking field 2 yields the ReservationName value instead, which then
+    # gets merged back in as a phantom node.
+    { /usr/bin/scontrol --oneliner show reservation "$RES_NAME" 2>/dev/null || true; } \
+      | grep -oE '(^| )Nodes=[^ ]+' | head -n1 | cut -d= -f2- || true
 }
 
 res_get_nodes_expanded() {
@@ -115,7 +148,9 @@ res_set_nodes_from_array() {
     compressed="$(/usr/bin/scontrol show hostlist "$csv")"
 
     echo "Updating reservation $RES_NAME nodes to: $compressed"
-    /usr/bin/scontrol update ReservationName="$RES_NAME" Nodes="$compressed" Users="$RES_USERS" Accounts="$RES_ACCOUNTS"
+    # IGNORE_JOBS lets the reservation cover a node whose job we are about to
+    # preempt; without it scontrol refuses because the node is busy.
+    /usr/bin/scontrol update ReservationName="$RES_NAME" Nodes="$compressed" Users="$RES_USERS" Accounts="$RES_ACCOUNTS" Flags=IGNORE_JOBS
 }
 
 res_create_with_nodes() {
@@ -125,6 +160,7 @@ res_create_with_nodes() {
         ReservationName="$RES_NAME" \
         StartTime=now Duration=INFINITE \
         Users=root Accounts=root \
+        Flags=IGNORE_JOBS \
         Nodes="$nodes_csv"
 }
 
@@ -248,6 +284,57 @@ reserved_nodes() {
         done
 }
 
+# Running jobs owned by the preemptible user+account, emitted as
+#   <elapsed_seconds>|<jobid>|<numnodes>|<nodelist>
+# sorted youngest first, so preemption costs the least compute.
+preemptible_jobs() {
+    local now
+    now="$(date +%s)"
+
+    { /usr/bin/squeue --noheader --states=RUNNING \
+        --user="$PREEMPT_USER" --account="$PREEMPT_ACCOUNT" \
+        --Format=JobID:24,NumNodes:12,StartTime:26,NodeList:2000 2>/dev/null || true; } \
+      | while read -r jid nn st nl _; do
+            if [[ -z "${nl:-}" || "$nl" == "(null)" || "$nl" == "N/A" ]]; then
+                continue
+            fi
+            local start elapsed
+            start="$(date -d "$st" +%s 2>/dev/null || echo 0)"
+            if (( start == 0 )); then
+                continue
+            fi
+            elapsed=$(( now - start ))
+            if (( elapsed < 0 )); then
+                elapsed=0
+            fi
+            if (( PREEMPT_MAX_RUNTIME_SECONDS > 0 && elapsed > PREEMPT_MAX_RUNTIME_SECONDS )); then
+                continue
+            fi
+            printf '%s|%s|%s|%s\n' "$elapsed" "$jid" "$nn" "$nl"
+        done \
+      | sort -t'|' -k1,1n
+}
+
+# Flattens preemptible_jobs to "<node> <jobid> <runtime> <numnodes>" for the
+# node report. Multi-node jobs are carried through so the report can explain why
+# they are not preemptible, rather than leaving the node looking plain busy.
+preemptible_node_map() {
+    local elapsed jid nn nl human n
+    while IFS='|' read -r elapsed jid nn nl; do
+        human="$(fmt_duration "$elapsed")"
+        while read -r n; do
+            [[ -n "$n" ]] && printf '%s %s %s %s\n' "$n" "$jid" "$human" "$nn"
+        done < <(/usr/bin/scontrol show hostnames "$nl" 2>/dev/null || true)
+    done < <(preemptible_jobs)
+}
+
+# The preemptible workload is single-node by construction. Preempting a
+# multi-node job would destroy several nodes' worth of work to satisfy a
+# one-node request, so those jobs are reported and skipped, never preempted.
+job_is_single_node() {
+    [[ "${1:-0}" == "1" ]]
+}
+
 # Largest node count requested by any pending job (0 if none / on error).
 largest_pending_nodecount() {
     { /usr/bin/squeue --noheader --states=PENDING --Format=NumNodes:20 2>/dev/null || true; } \
@@ -257,29 +344,38 @@ largest_pending_nodecount() {
 # Judges every node matching the (optional) name prefix and prints one
 # pipe-delimited record per node:
 #
-#     <node>|<state>|<idle_seconds>|<OK|SKIP>|<reason>
+#     <node>|<state>|<idle_seconds>|<OK|PREEMPT|SKIP>|<reason>
 #
 # A node is OK only if it is base-state IDLE with no disqualifying flag, has
 # been idle at least MIN_IDLE_SECONDS, is not earmarked for a pending job, and
-# is not in a current or imminent reservation. This is the single source of
-# truth for both --list and the conversion paths.
+# is not in a current or imminent reservation. A busy node is PREEMPT when the
+# job holding it belongs to the preemptible user+account and nothing else
+# (reservation, backfill plan) disqualifies the node. This is the single source
+# of truth for both --list and the conversion paths.
 node_report() {
     local prefix="${1:-}"
-    local now planned_file reserved_file
+    local now planned_file reserved_file preempt_file
     now="$(date +%s)"
 
     planned_file="$(mktemp)"
     reserved_file="$(mktemp)"
-    trap 'rm -f "$planned_file" "$reserved_file"' RETURN
-    planned_nodes  | awk 'NF' | sort -u -k1,1 > "$planned_file"
-    reserved_nodes | awk 'NF' | sort -u -k1,1 > "$reserved_file"
+    preempt_file="$(mktemp)"
+    trap 'rm -f "$planned_file" "$reserved_file" "$preempt_file"' RETURN
+    planned_nodes        | awk 'NF' | sort -u -k1,1 > "$planned_file"
+    reserved_nodes       | awk 'NF' | sort -u -k1,1 > "$reserved_file"
+    preemptible_node_map | awk 'NF' | sort -u -k1,1 > "$preempt_file"
 
     { /usr/bin/scontrol --oneliner show nodes 2>/dev/null || true; } \
       | awk -v prefix="$prefix" -v planned="$planned_file" -v reserved="$reserved_file" \
+            -v preempt="$preempt_file" -v puser="$PREEMPT_USER" -v pacct="$PREEMPT_ACCOUNT" \
             -v bad="$EXCLUDE_STATE_FLAGS" '
           BEGIN {
             while ((getline line < planned) > 0)  { split(line, a, " "); if (a[1] != "") pjob[a[1]] = a[2] }
             while ((getline line < reserved) > 0) { split(line, a, " "); if (a[1] != "") pres[a[1]] = a[2] }
+            while ((getline line < preempt) > 0) {
+                split(line, a, " ")
+                if (a[1] != "") { pmjob[a[1]] = a[2]; pmage[a[1]] = a[3]; pmcnt[a[1]] = a[4] }
+            }
           }
           {
             delete f
@@ -298,16 +394,26 @@ node_report() {
             verdict = "OK"; reason = "-"
             m = split(state, sf, "+")
             if (sf[1] != "IDLE") {
-                verdict = "SKIP"; reason = "not idle (" sf[1] ")"
+                if ((name in pmjob) && pmcnt[name] + 0 == 1) {
+                    verdict = "PREEMPT"
+                    reason = "job " pmjob[name] " (" puser "/" pacct ") running " pmage[name]
+                } else if (name in pmjob) {
+                    verdict = "SKIP"
+                    reason = "job " pmjob[name] " spans " pmcnt[name] " nodes; only single-node jobs are preemptible"
+                } else {
+                    verdict = "SKIP"; reason = "not idle (" sf[1] ")"
+                }
             } else {
                 for (i = 2; i <= m; i++) {
                     if (sf[i] ~ ("^(" bad ")$")) { verdict = "SKIP"; reason = "state flag " sf[i]; break }
                 }
             }
-            if (verdict == "OK" && (name in pjob)) {
+            # A node the backfill scheduler is counting on, or one inside a
+            # reservation, is off limits even if a preemptible job holds it.
+            if (verdict != "SKIP" && (name in pjob)) {
                 verdict = "SKIP"; reason = "planned for pending job " pjob[name]
             }
-            if (verdict == "OK" && (name in pres)) {
+            if (verdict != "SKIP" && (name in pres)) {
                 verdict = "SKIP"; reason = "reservation " pres[name]
             }
 
@@ -345,9 +451,159 @@ select_eligible_nodes() {
       | sort -k1,1nr | cut -f2
 }
 
+# Base state of a node with all flags stripped ("IDLE" from "IDLE+RESERVED").
+node_base_state() {
+    local st
+    st="$({ /usr/bin/scontrol --oneliner show node "$1" 2>/dev/null || true; } \
+          | grep -oE '(^| )State=[^ ]+' | head -n1 | cut -d= -f2 || true)"
+    printf '%s' "${st%%+*}"
+}
+
+# Waits for a preempted node to finish COMPLETING and come back IDLE.
+wait_for_node_idle() {
+    local node="$1" deadline
+    deadline=$(( $(date +%s) + PREEMPT_DRAIN_TIMEOUT ))
+    while (( $(date +%s) < deadline )); do
+        if [[ "$(node_base_state "$node")" == "IDLE" ]]; then
+            return 0
+        fi
+        sleep 5
+    done
+    return 1
+}
+
+job_is_requeueable() {
+    local v
+    v="$({ /usr/bin/scontrol --oneliner show job "$1" 2>/dev/null || true; } \
+         | grep -oE '(^| )Requeue=[0-9]+' | head -n1 | cut -d= -f2 || true)"
+    [[ "${v:-1}" != "0" ]]
+}
+
+# Preempts one single-node job and waits for its node to come free.
+# Returns 0 and leaves the node IDLE and reserved; returns 1 having changed
+# nothing (or having released the reservation again) on any failure.
+preempt_job() {
+    local jid="$1" node="$2"
+
+    if [[ "$PREEMPT_MODE" != "cancel" ]] && ! job_is_requeueable "$jid"; then
+        echo "PREEMPT: job $jid is not requeueable (Requeue=0); skipping. Set PREEMPT_MODE=cancel to kill it instead." >&2
+        return 1
+    fi
+
+    # Claim the node *before* freeing it. IGNORE_JOBS lets the reservation cover
+    # a busy node, so the scheduler cannot hand it to another job in the window
+    # between the job exiting and k8s-convert running.
+    echo "PREEMPT: reserving $node ahead of preempting job $jid" >&2
+    if ! res_add_nodes "$node" >&2; then
+        echo "PREEMPT: could not reserve $node; leaving job $jid alone" >&2
+        return 1
+    fi
+
+    if (( PREEMPT_GRACE_SECONDS > 0 )); then
+        echo "PREEMPT: sending TERM to job $jid, ${PREEMPT_GRACE_SECONDS}s grace" >&2
+        /usr/bin/scancel --signal=TERM --full "$jid" >&2 || true
+        sleep "$PREEMPT_GRACE_SECONDS"
+    fi
+
+    if [[ "$PREEMPT_MODE" == "cancel" ]]; then
+        echo "PREEMPT: cancelling job $jid ($PREEMPT_USER/$PREEMPT_ACCOUNT) on $node" >&2
+        if ! /usr/bin/scancel "$jid" >&2; then
+            echo "PREEMPT: scancel failed for job $jid; releasing reservation on $node" >&2
+            res_remove_nodes "$node" >&2 || true
+            return 1
+        fi
+    else
+        echo "PREEMPT: requeueing job $jid ($PREEMPT_USER/$PREEMPT_ACCOUNT) on $node" >&2
+        if ! /usr/bin/scontrol requeue "$jid" >&2; then
+            echo "PREEMPT: requeue failed for job $jid; releasing reservation on $node" >&2
+            res_remove_nodes "$node" >&2 || true
+            return 1
+        fi
+    fi
+
+    if ! wait_for_node_idle "$node"; then
+        echo "PREEMPT: $node did not return to IDLE within ${PREEMPT_DRAIN_TIMEOUT}s" >&2
+        return 1
+    fi
+
+    echo "PREEMPT: $node is now IDLE" >&2
+}
+
+# Preempts youngest-first until <want> nodes matching <prefix> are free.
+# Prints the freed node names.
+preempt_free_nodes() {
+    local want="$1" prefix="${2:-}"
+    local got=0 freed_all=()
+    local elapsed jid nn nl node
+
+    while IFS='|' read -r elapsed jid nn nl; do
+        if (( got >= want )); then
+            break
+        fi
+
+        if ! job_is_single_node "$nn"; then
+            echo "PREEMPT: skipping job $jid (spans ${nn} nodes; only single-node jobs are preemptible)" >&2
+            continue
+        fi
+
+        node="$(/usr/bin/scontrol show hostnames "$nl" 2>/dev/null | head -n1 || true)"
+        if [[ -z "$node" ]]; then
+            echo "PREEMPT: job $jid has no expandable node list ('$nl'); skipping" >&2
+            continue
+        fi
+
+        if [[ -n "$prefix" && "$node" != "$prefix"* ]]; then
+            echo "PREEMPT: skipping job $jid (node $node is outside type '$prefix')" >&2
+            continue
+        fi
+
+        # Confirm the node is usable before destroying work to get it.
+        if ! is_node_reachable "$node" >&2; then
+            echo "PREEMPT: skipping job $jid ($node is unreachable)" >&2
+            continue
+        fi
+
+        echo "PREEMPT: selecting job $jid (running $(fmt_duration "$elapsed")) to free $node" >&2
+        if preempt_job "$jid" "$node"; then
+            freed_all+=("$node")
+            got=$(( got + 1 ))
+        fi
+    done < <(preemptible_jobs)
+
+    if ((${#freed_all[@]})); then
+        printf '%s\n' "${freed_all[@]}"
+    fi
+}
+
+# Frees one specific node by preempting whichever preemptible job holds it.
+preempt_free_named_node() {
+    local node="$1"
+    local elapsed jid nn nl jnode found=0 hit_jid="" hit_nn=""
+
+    while IFS='|' read -r elapsed jid nn nl; do
+        jnode="$(/usr/bin/scontrol show hostnames "$nl" 2>/dev/null | grep -xF "$node" || true)"
+        if [[ -n "$jnode" ]]; then
+            hit_jid="$jid"; hit_nn="$nn"; found=1
+            break
+        fi
+    done < <(preemptible_jobs)
+
+    if (( found == 0 )); then
+        echo "PREEMPT: no preemptible job ($PREEMPT_USER/$PREEMPT_ACCOUNT) is holding $node" >&2
+        return 1
+    fi
+
+    if ! job_is_single_node "$hit_nn"; then
+        echo "PREEMPT: job $hit_jid holds $node but spans ${hit_nn} nodes; only single-node jobs are preemptible" >&2
+        return 1
+    fi
+
+    preempt_job "$hit_jid" "$node"
+}
+
 # Human-readable dump of every node and why it is or is not viable.
 list_viable_nodes() {
-    local prefix="${1:-}" report ok_count total largest
+    local prefix="${1:-}" report ok_count preempt_count total largest
     report="$(node_report "$prefix")"
 
     printf '%-16s %-24s %12s  %-7s %s\n' "NODE" "STATE" "IDLE" "VERDICT" "REASON"
@@ -360,15 +616,23 @@ list_viable_nodes() {
             done
     fi
 
-    total=0; ok_count=0
+    total=0; ok_count=0; preempt_count=0
     if [[ -n "$report" ]]; then
         total="$(printf '%s\n' "$report" | wc -l | tr -d ' ')"
         ok_count="$(printf '%s\n' "$report" | awk -F'|' '$4 == "OK"' | wc -l | tr -d ' ')"
+        preempt_count="$(printf '%s\n' "$report" | awk -F'|' '$4 == "PREEMPT"' | wc -l | tr -d ' ')"
     fi
 
     echo
-    echo "Viable: ${ok_count} of ${total} node(s)${prefix:+ matching prefix '${prefix}'}"
+    echo "Viable now: ${ok_count} of ${total} node(s)${prefix:+ matching prefix '${prefix}'}"
     echo "Thresholds: MIN_IDLE_SECONDS=${MIN_IDLE_SECONDS} RES_LOOKAHEAD_SECONDS=${RES_LOOKAHEAD_SECONDS}"
+
+    echo "Preemptible: ${preempt_count} node(s) held by ${PREEMPT_USER}/${PREEMPT_ACCOUNT}"
+    if (( ALLOW_PREEMPT > 0 )); then
+        echo "Preemption: ENABLED, mode=${PREEMPT_MODE}, grace=${PREEMPT_GRACE_SECONDS}s"
+    else
+        echo "Preemption: disabled (pass --allow-preempt or set PREEMPT_ENABLED=1), would use mode=${PREEMPT_MODE}"
+    fi
 
     largest="$(largest_pending_nodecount)"
     if (( largest > 0 )); then
@@ -381,13 +645,14 @@ list_viable_nodes() {
     fi
 }
 
-# Renders a second count as e.g. "2d 3h" / "45m" for the --list table.
+# Renders a second count as e.g. "2d3h" / "45m". No spaces: the result is also
+# embedded in the reason column.
 fmt_duration() {
     local s="${1:-0}"
     if (( s >= 86400 )); then
-        printf '%dd %dh' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
+        printf '%dd%dh' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
     elif (( s >= 3600 )); then
-        printf '%dh %dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+        printf '%dh%dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
     elif (( s >= 60 )); then
         printf '%dm' $(( s / 60 ))
     else
@@ -400,9 +665,8 @@ fmt_duration() {
 verify_still_idle() {
     local rc=0 n st
     for n in "$@"; do
-        st="$({ /usr/bin/scontrol --oneliner show node "$n" 2>/dev/null || true; } \
-              | grep -oE '(^| )State=[^ ]+' | head -n1 | cut -d= -f2 || true)"
-        if [[ "${st%%+*}" != "IDLE" ]]; then
+        st="$(node_base_state "$n")"
+        if [[ "$st" != "IDLE" ]]; then
             echo "RACE: $n is now State=${st:-unknown}; Slurm claimed it after selection" >&2
             rc=1
         fi
@@ -422,6 +686,7 @@ while [[ $# -gt 0 ]]; do
         --num-nodes)  NUM_NODES="$2";  shift 2 ;;
         --namespace)  NAMESPACE="$2";  shift 2 ;;
         --list)       LIST_ONLY=1;     shift ;;
+        --allow-preempt) ALLOW_PREEMPT=1; shift ;;
         --help)       usage ;;
         *)            usage ;;
     esac
@@ -452,17 +717,37 @@ case $CONVERT_TO in
         if [[ -z "$NODE_NAME" ]]; then
             mapfile -t candidates < <(select_eligible_nodes "$NODE_TYPE")
 
-            if ((${#candidates[@]} == 0)); then
-                echo "No eligible idle nodes of type '${NODE_TYPE}' found (need IDLE, no PLANNED/RESERVED/DRAIN flag, idle >= ${MIN_IDLE_SECONDS}s, not planned for a pending job)" >&2
-                exit 1
-            fi
-
+            # The pool guard is judged on genuinely idle nodes, before any
+            # preemption: if a big job is already starved, do not make it worse.
             if (( PROTECT_LARGEST_PENDING > 0 )); then
                 largest="$(largest_pending_nodecount)"
                 if (( largest > 0 && ${#candidates[@]} - NUM_NODES < largest )); then
                     echo "Refusing to convert ${NUM_NODES} node(s): would leave $(( ${#candidates[@]} - NUM_NODES )) eligible idle node(s), below the largest pending job (${largest} nodes)" >&2
                     exit 1
                 fi
+            fi
+
+            # Nothing idle? Fall back to preempting single-node backfill jobs.
+            preempted=()
+            if ((${#candidates[@]} < NUM_NODES)) && (( ALLOW_PREEMPT > 0 )); then
+                deficit=$(( NUM_NODES - ${#candidates[@]} ))
+                echo "Only ${#candidates[@]} idle node(s) of type '${NODE_TYPE}'; preempting up to ${deficit} more from ${PREEMPT_USER}/${PREEMPT_ACCOUNT} (mode=${PREEMPT_MODE})"
+                preempted=()
+                mapfile -t preempted < <(preempt_free_nodes "$deficit" "$NODE_TYPE")
+                if ((${#preempted[@]})); then
+                    echo "Preemption freed ${#preempted[@]} node(s): ${preempted[*]}"
+                    candidates+=("${preempted[@]}")
+                else
+                    echo "Preemption freed no nodes" >&2
+                fi
+            fi
+
+            if ((${#candidates[@]} == 0)); then
+                echo "No eligible idle nodes of type '${NODE_TYPE}' found (need IDLE, no PLANNED/RESERVED/DRAIN flag, idle >= ${MIN_IDLE_SECONDS}s, not planned for a pending job)" >&2
+                if (( ALLOW_PREEMPT == 0 )); then
+                    echo "Run with --allow-preempt to preempt ${PREEMPT_USER}/${PREEMPT_ACCOUNT} backfill jobs; 'node-convert --list' shows what that would free." >&2
+                fi
+                exit 1
             fi
 
             reachable=()
@@ -480,6 +765,12 @@ case $CONVERT_TO in
 
             if ((${#reachable[@]} < NUM_NODES)); then
                 echo "Only found ${#reachable[@]} reachable nodes (requested ${NUM_NODES})" >&2
+                # Nothing will be converted, so do not strand preempted nodes in
+                # the reservation where Slurm can never schedule them again.
+                if ((${#preempted[@]})); then
+                    echo "Releasing preempted node(s) back to Slurm: ${preempted[*]}" >&2
+                    res_remove_nodes "${preempted[@]}" >&2 || true
+                fi
                 exit 1
             fi
 
@@ -488,7 +779,7 @@ case $CONVERT_TO in
                 mark_node "$node"
             done
 
-            IFS=, read -r -a _tmp <<< "${reachable[*]}"; nodes_csv="${_tmp[*]}"; unset _tmp
+            nodes_csv="$(IFS=, ; echo "${reachable[*]}")"
 
             # ---- reservation: add nodes ----
             res_add_nodes "${reachable[@]}"
@@ -513,8 +804,19 @@ case $CONVERT_TO in
 
         # Single node
         else
-            if ! select_eligible_nodes "" | grep -qxF "$NODE_NAME"; then
+            verdict="$(node_report "$NODE_NAME" | awk -F'|' -v n="$NODE_NAME" '$1 == n { print $4; exit }')"
+            if [[ "$verdict" == "PREEMPT" && $ALLOW_PREEMPT -gt 0 ]]; then
+                echo "$NODE_NAME is held by a preemptible ${PREEMPT_USER}/${PREEMPT_ACCOUNT} job; preempting it (mode=${PREEMPT_MODE})"
+                if ! preempt_free_named_node "$NODE_NAME"; then
+                    echo "Could not free $NODE_NAME by preemption. Please pick another node." >&2
+                    exit 1
+                fi
+            elif [[ "$verdict" != "OK" ]]; then
                 echo "$NODE_NAME is not eligible: it must be IDLE with no PLANNED/RESERVED/DRAIN flag, idle for >= ${MIN_IDLE_SECONDS}s, and not planned for a pending job. Please pick another node." >&2
+                node_report "$NODE_NAME" | awk -F'|' -v n="$NODE_NAME" '$1 == n { print "  reason: " $5 }' >&2
+                if [[ "$verdict" == "PREEMPT" ]]; then
+                    echo "  (pass --allow-preempt to preempt the job holding it)" >&2
+                fi
                 exit 1
             fi
             if ! is_node_reachable "$NODE_NAME"; then
