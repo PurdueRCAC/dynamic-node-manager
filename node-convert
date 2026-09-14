@@ -6,6 +6,7 @@ NODE_NAME=""
 NODE_TYPE=""
 NUM_NODES=""
 NAMESPACE=""
+LIST_ONLY=0
 SET_K8S="/usr/site/rcac/sbin/k8s-convert"
 
 # Discover default search domain for FQDN pings (may be empty)
@@ -15,16 +16,37 @@ RES_NAME="k8s"
 RES_USERS="root"
 RES_ACCOUNTS="root"
 
+# ---------------- Node eligibility tuning ----------------
+# A node must have been idle at least this long before it can be taken.
+MIN_IDLE_SECONDS="${MIN_IDLE_SECONDS:-600}"
+# Reservations starting within this window make their nodes ineligible.
+RES_LOOKAHEAD_SECONDS="${RES_LOOKAHEAD_SECONDS:-86400}"
+# Optional pool guard: refuse to convert if doing so would leave fewer eligible
+# idle nodes than the largest pending job needs. 0 disables the check.
+PROTECT_LARGEST_PENDING="${PROTECT_LARGEST_PENDING:-0}"
+# Slurm state flags that disqualify an otherwise-IDLE node.
+EXCLUDE_STATE_FLAGS="DRAIN|DRAINING|DRAINED|DOWN|FAIL|FAILING|MAINT|PLANNED|RESERVED|REBOOT_REQUESTED|REBOOT_ISSUED|POWER_DOWN|POWERING_DOWN|POWERING_UP|POWERED_DOWN|NOT_RESPONDING|INVALID_REG|COMPLETING"
+
 usage() {
     cat <<EOF
 Usage: $0 --set <k8s|batch> [--node-name <name> | (--node-type a|b|g --num-nodes <num>)] [--namespace <ns>]
+       $0 --list [--node-type a|b|g | --node-name <name>]
 
-    --set         k8s | batch   (required)
+    --set         k8s | batch   (required unless --list)
     --node-name   Convert a single node by name
     --node-type   Node type prefix (a|b|g) to select from (required with --num-nodes)
     --num-nodes   Number of nodes to convert (required with --node-type)
     --namespace   Namespace tag to apply on converted nodes (label/taint as <ns>=true)
+    --list        Read-only: show which Slurm nodes are viable for conversion and
+                  why the rest are not. Changes nothing.
     --help        This message
+
+Environment overrides (both modes):
+    MIN_IDLE_SECONDS         Minimum idle time before a node is viable (default 600)
+    RES_LOOKAHEAD_SECONDS    Treat reservations starting within this window as
+                             blocking (default 86400)
+    PROTECT_LARGEST_PENDING  1 = refuse to convert if it would leave fewer viable
+                             nodes than the largest pending job needs (default 0)
 EOF
     exit 1
 }
@@ -170,6 +192,226 @@ res_remove_nodes() {
 
 # -----------------------------------------------------------
 
+# ---------------- Node eligibility helpers ----------------
+
+# Nodes the Slurm scheduler has already earmarked for a pending job, emitted as
+# "<node> <jobid>". Backfill publishes its plan as SchedNodes on the pending job;
+# those nodes sit IDLE on purpose while the job's other resources free up.
+planned_nodes() {
+    { /usr/bin/squeue --noheader --states=PENDING --Format=JobID:24,SchedNodes:2000 2>/dev/null || true; } \
+      | while read -r jid hl _; do
+            if [[ -z "${hl:-}" || "$hl" == "(null)" || "$hl" == "N/A" ]]; then
+                continue
+            fi
+            while read -r n; do
+                [[ -n "$n" ]] && printf '%s %s\n' "$n" "$jid"
+            done < <(/usr/bin/scontrol show hostnames "$hl" 2>/dev/null || true)
+        done
+}
+
+# Nodes covered by a reservation that is active now or starts within the
+# lookahead window, emitted as "<node> <reservation>". Our own k8s reservation
+# is excluded.
+reserved_nodes() {
+    local now horizon
+    now="$(date +%s)"
+    horizon=$(( now + RES_LOOKAHEAD_SECONDS ))
+
+    { /usr/bin/scontrol --oneliner show reservation 2>/dev/null || true; } \
+      | awk '
+          {
+            delete f
+            n = split($0, t, " ")
+            for (i = 1; i <= n; i++) {
+                p = index(t[i], "=")
+                if (p > 1) {
+                    k = substr(t[i], 1, p - 1); v = substr(t[i], p + 1)
+                    if (!(k in f)) f[k] = v
+                }
+            }
+            if (f["ReservationName"] == "" || f["Nodes"] == "" || f["Nodes"] == "(null)") next
+            print f["ReservationName"] "|" f["StartTime"] "|" f["EndTime"] "|" f["Nodes"]
+          }' \
+      | while IFS='|' read -r name start end nodes; do
+            if [[ "$name" == "$RES_NAME" ]]; then
+                continue
+            fi
+            local s e
+            s="$(date -d "$start" +%s 2>/dev/null || echo 0)"
+            e="$(date -d "$end" +%s 2>/dev/null || echo 9999999999)"
+            if (( e < now )) || (( s > horizon )); then
+                continue
+            fi
+            while read -r n; do
+                [[ -n "$n" ]] && printf '%s %s\n' "$n" "$name"
+            done < <(/usr/bin/scontrol show hostnames "$nodes" 2>/dev/null || true)
+        done
+}
+
+# Largest node count requested by any pending job (0 if none / on error).
+largest_pending_nodecount() {
+    { /usr/bin/squeue --noheader --states=PENDING --Format=NumNodes:20 2>/dev/null || true; } \
+      | awk '{ gsub(/[^0-9].*$/, "", $1); if ($1 + 0 > max) max = $1 + 0 } END { print max + 0 }'
+}
+
+# Judges every node matching the (optional) name prefix and prints one
+# pipe-delimited record per node:
+#
+#     <node>|<state>|<idle_seconds>|<OK|SKIP>|<reason>
+#
+# A node is OK only if it is base-state IDLE with no disqualifying flag, has
+# been idle at least MIN_IDLE_SECONDS, is not earmarked for a pending job, and
+# is not in a current or imminent reservation. This is the single source of
+# truth for both --list and the conversion paths.
+node_report() {
+    local prefix="${1:-}"
+    local now planned_file reserved_file
+    now="$(date +%s)"
+
+    planned_file="$(mktemp)"
+    reserved_file="$(mktemp)"
+    trap 'rm -f "$planned_file" "$reserved_file"' RETURN
+    planned_nodes  | awk 'NF' | sort -u -k1,1 > "$planned_file"
+    reserved_nodes | awk 'NF' | sort -u -k1,1 > "$reserved_file"
+
+    { /usr/bin/scontrol --oneliner show nodes 2>/dev/null || true; } \
+      | awk -v prefix="$prefix" -v planned="$planned_file" -v reserved="$reserved_file" \
+            -v bad="$EXCLUDE_STATE_FLAGS" '
+          BEGIN {
+            while ((getline line < planned) > 0)  { split(line, a, " "); if (a[1] != "") pjob[a[1]] = a[2] }
+            while ((getline line < reserved) > 0) { split(line, a, " "); if (a[1] != "") pres[a[1]] = a[2] }
+          }
+          {
+            delete f
+            n = split($0, t, " ")
+            for (i = 1; i <= n; i++) {
+                p = index(t[i], "=")
+                if (p > 1) {
+                    k = substr(t[i], 1, p - 1); v = substr(t[i], p + 1)
+                    if (!(k in f)) f[k] = v
+                }
+            }
+            name = f["NodeName"]; state = f["State"]
+            if (name == "" || state == "") next
+            if (prefix != "" && index(name, prefix) != 1) next
+
+            verdict = "OK"; reason = "-"
+            m = split(state, sf, "+")
+            if (sf[1] != "IDLE") {
+                verdict = "SKIP"; reason = "not idle (" sf[1] ")"
+            } else {
+                for (i = 2; i <= m; i++) {
+                    if (sf[i] ~ ("^(" bad ")$")) { verdict = "SKIP"; reason = "state flag " sf[i]; break }
+                }
+            }
+            if (verdict == "OK" && (name in pjob)) {
+                verdict = "SKIP"; reason = "planned for pending job " pjob[name]
+            }
+            if (verdict == "OK" && (name in pres)) {
+                verdict = "SKIP"; reason = "reservation " pres[name]
+            }
+
+            lb = f["LastBusyTime"]
+            if (lb == "") lb = "Unknown"
+            print name "|" state "|" lb "|" verdict "|" reason
+          }' \
+      | while IFS='|' read -r name state lb verdict reason; do
+            local lb_epoch age
+            if [[ "$lb" == "Unknown" || -z "$lb" ]]; then
+                # No timestamp to judge by; assume it just crossed the threshold.
+                age="$MIN_IDLE_SECONDS"
+            else
+                lb_epoch="$(date -d "$lb" +%s 2>/dev/null || echo 0)"
+                if (( lb_epoch == 0 )); then
+                    age="$MIN_IDLE_SECONDS"
+                else
+                    age=$(( now - lb_epoch ))
+                fi
+            fi
+            if (( age < 0 )); then
+                age=0
+            fi
+            if [[ "$verdict" == "OK" ]] && (( age < MIN_IDLE_SECONDS )); then
+                verdict="SKIP"; reason="idle only ${age}s (< ${MIN_IDLE_SECONDS}s)"
+            fi
+            printf '%s|%s|%s|%s|%s\n' "$name" "$state" "$age" "$verdict" "$reason"
+        done
+}
+
+# Prints eligible node names, longest-idle first.
+select_eligible_nodes() {
+    node_report "${1:-}" \
+      | awk -F'|' '$4 == "OK" { print $3 "\t" $1 }' \
+      | sort -k1,1nr | cut -f2
+}
+
+# Human-readable dump of every node and why it is or is not viable.
+list_viable_nodes() {
+    local prefix="${1:-}" report ok_count total largest
+    report="$(node_report "$prefix")"
+
+    printf '%-16s %-24s %12s  %-7s %s\n' "NODE" "STATE" "IDLE" "VERDICT" "REASON"
+    if [[ -n "$report" ]]; then
+        printf '%s\n' "$report" \
+          | sort -t'|' -k4,4 -k3,3nr \
+          | while IFS='|' read -r name state age verdict reason; do
+                printf '%-16s %-24s %12s  %-7s %s\n' \
+                    "$name" "$state" "$(fmt_duration "$age")" "$verdict" "$reason"
+            done
+    fi
+
+    total=0; ok_count=0
+    if [[ -n "$report" ]]; then
+        total="$(printf '%s\n' "$report" | wc -l | tr -d ' ')"
+        ok_count="$(printf '%s\n' "$report" | awk -F'|' '$4 == "OK"' | wc -l | tr -d ' ')"
+    fi
+
+    echo
+    echo "Viable: ${ok_count} of ${total} node(s)${prefix:+ matching prefix '${prefix}'}"
+    echo "Thresholds: MIN_IDLE_SECONDS=${MIN_IDLE_SECONDS} RES_LOOKAHEAD_SECONDS=${RES_LOOKAHEAD_SECONDS}"
+
+    largest="$(largest_pending_nodecount)"
+    if (( largest > 0 )); then
+        echo "Largest pending job requests ${largest} node(s)."
+        if (( PROTECT_LARGEST_PENDING > 0 )); then
+            echo "PROTECT_LARGEST_PENDING=1: at most $(( ok_count - largest < 0 ? 0 : ok_count - largest )) node(s) may be converted."
+        else
+            echo "PROTECT_LARGEST_PENDING=0: pool guard disabled."
+        fi
+    fi
+}
+
+# Renders a second count as e.g. "2d 3h" / "45m" for the --list table.
+fmt_duration() {
+    local s="${1:-0}"
+    if (( s >= 86400 )); then
+        printf '%dd %dh' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
+    elif (( s >= 3600 )); then
+        printf '%dh %dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
+    elif (( s >= 60 )); then
+        printf '%dm' $(( s / 60 ))
+    else
+        printf '%ds' "$s"
+    fi
+}
+
+# Re-checks nodes after they were added to the reservation, to catch a job that
+# started in the gap between selection and reservation.
+verify_still_idle() {
+    local rc=0 n st
+    for n in "$@"; do
+        st="$({ /usr/bin/scontrol --oneliner show node "$n" 2>/dev/null || true; } \
+              | grep -oE '(^| )State=[^ ]+' | head -n1 | cut -d= -f2 || true)"
+        if [[ "${st%%+*}" != "IDLE" ]]; then
+            echo "RACE: $n is now State=${st:-unknown}; Slurm claimed it after selection" >&2
+            rc=1
+        fi
+    done
+    return $rc
+}
+
+# -----------------------------------------------------------
+
 # -------- arg parsing --------
 while [[ $# -gt 0 ]]; do
     key="$1"
@@ -179,10 +421,18 @@ while [[ $# -gt 0 ]]; do
         --node-type)  NODE_TYPE="$2";  shift 2 ;;
         --num-nodes)  NUM_NODES="$2";  shift 2 ;;
         --namespace)  NAMESPACE="$2";  shift 2 ;;
+        --list)       LIST_ONLY=1;     shift ;;
         --help)       usage ;;
         *)            usage ;;
     esac
 done
+
+# Read-only inspection mode: report and exit before any validation or mutation.
+if (( LIST_ONLY )); then
+    list_viable_nodes "${NODE_NAME:-${NODE_TYPE}}"
+    exit 0
+fi
+
 [[ -z "$CONVERT_TO" ]] && usage
 
 if [[ -n "$NODE_NAME" && ( -n "$NODE_TYPE" || -n "$NUM_NODES" ) ]]; then
@@ -200,15 +450,19 @@ case $CONVERT_TO in
     k8s )
         # Multi-node
         if [[ -z "$NODE_NAME" ]]; then
-            mapfile -t candidates < <(
-                /usr/bin/scontrol --oneliner show nodes \
-                | awk -F'[ =]' -v node_type="$NODE_TYPE" '
-                    /State=IDLE/ && $0 !~ /\+DRAIN/ && $2 ~ ("^" node_type) { print $2 }'
-            )
+            mapfile -t candidates < <(select_eligible_nodes "$NODE_TYPE")
 
             if ((${#candidates[@]} == 0)); then
-                echo "No eligible idle nodes of type '${NODE_TYPE}' found" >&2
+                echo "No eligible idle nodes of type '${NODE_TYPE}' found (need IDLE, no PLANNED/RESERVED/DRAIN flag, idle >= ${MIN_IDLE_SECONDS}s, not planned for a pending job)" >&2
                 exit 1
+            fi
+
+            if (( PROTECT_LARGEST_PENDING > 0 )); then
+                largest="$(largest_pending_nodecount)"
+                if (( largest > 0 && ${#candidates[@]} - NUM_NODES < largest )); then
+                    echo "Refusing to convert ${NUM_NODES} node(s): would leave $(( ${#candidates[@]} - NUM_NODES )) eligible idle node(s), below the largest pending job (${largest} nodes)" >&2
+                    exit 1
+                fi
             fi
 
             reachable=()
@@ -239,6 +493,13 @@ case $CONVERT_TO in
             # ---- reservation: add nodes ----
             res_add_nodes "${reachable[@]}"
 
+            # The reservation is the real claim; confirm nothing landed first.
+            if ! verify_still_idle "${reachable[@]}"; then
+                echo "Rolling back reservation membership for: ${reachable[*]}" >&2
+                res_remove_nodes "${reachable[@]}"
+                exit 1
+            fi
+
             # Pass namespace via env so k8s-convert/k8s-register can use it
             pdsh -w "$nodes_csv" "env NAMESPACE='${NAMESPACE}' $SET_K8S"
             rc=$?
@@ -252,8 +513,8 @@ case $CONVERT_TO in
 
         # Single node
         else
-            if ! /usr/bin/scontrol show node "$NODE_NAME" | grep -q 'State=IDLE '; then
-                echo "$NODE_NAME is not in IDLE state. Please pick another node." >&2
+            if ! select_eligible_nodes "" | grep -qxF "$NODE_NAME"; then
+                echo "$NODE_NAME is not eligible: it must be IDLE with no PLANNED/RESERVED/DRAIN flag, idle for >= ${MIN_IDLE_SECONDS}s, and not planned for a pending job. Please pick another node." >&2
                 exit 1
             fi
             if ! is_node_reachable "$NODE_NAME"; then
@@ -265,6 +526,13 @@ case $CONVERT_TO in
 
             # ---- reservation: add node ----
             res_add_nodes "$NODE_NAME"
+
+            if ! verify_still_idle "$NODE_NAME"; then
+                echo "Rolling back reservation membership for: $NODE_NAME" >&2
+                res_remove_nodes "$NODE_NAME"
+                exit 1
+            fi
+
             pdsh -w "$NODE_NAME" "env NAMESPACE='${NAMESPACE}' $SET_K8S"
             rc=$?
             if (( rc != 0 )); then

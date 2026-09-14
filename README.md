@@ -145,6 +145,57 @@ Continuously:
 - `/usr/site/rcac/sbin/node-convert`  
   Used to convert nodes between Slurm batch and Kubernetes.
 
+#### Checking viability without converting
+
+```
+node-convert --list                     # every Slurm node
+node-convert --list --node-type a       # only 'a' nodes
+node-convert --list --node-name a001    # one node
+```
+
+Read-only: it runs the exact same eligibility logic the conversion path uses and
+prints a verdict per node, so you can see *why* a node was rejected.
+
+```
+NODE             STATE                            IDLE  VERDICT REASON
+a001             IDLE                          12h 40m  OK      -
+a006             IDLE                           4d 14h  SKIP    reservation maint_sep
+a007             IDLE                           2d 14h  SKIP    planned for pending job 5510003
+a003             IDLE+DRAIN                      1d 5h  SKIP    state flag DRAIN
+a002             IDLE+PLANNED                   5h 40m  SKIP    state flag PLANNED
+a004             ALLOCATED                         40m  SKIP    not idle (ALLOCATED)
+a005             IDLE                              30s  SKIP    idle only 30s (< 600s)
+
+Viable: 1 of 7 node(s) matching prefix 'a'
+```
+
+#### Node eligibility (batch → k8s)
+
+A Slurm node is only taken if **all** of these hold:
+
+- base state is `IDLE` with no `PLANNED`, `RESERVED`, `DRAIN*`, `DOWN`, `FAIL*`,
+  `MAINT`, `REBOOT_*`, `POWER*`, `NOT_RESPONDING`, `INVALID_REG` or `COMPLETING` flag
+- `LastBusyTime` is at least `MIN_IDLE_SECONDS` ago
+- the node is not listed in `SchedNodes` of any pending job (i.e. the backfill
+  scheduler has not already earmarked it for a job that is waiting to start)
+- the node is not in a reservation that is active or starts within
+  `RES_LOOKAHEAD_SECONDS` (the `k8s` reservation itself is excluded)
+
+Candidates are sorted longest-idle first. After the node joins the `k8s`
+reservation its state is re-checked, and reservation membership is rolled back
+if Slurm allocated it in the meantime.
+
+Environment overrides:
+
+- `MIN_IDLE_SECONDS` (default `600`)
+- `RES_LOOKAHEAD_SECONDS` (default `86400`)
+- `PROTECT_LARGEST_PENDING` (default `0`, disabled) — when set to `1`, refuse to
+  convert if doing so would leave fewer eligible idle nodes than the largest
+  pending job requests.
+
+Note: the `PLANNED` node state requires Slurm 22.05 or newer; on older versions
+the `SchedNodes` check carries most of the weight.
+
 ---
 
 ## Configuration
