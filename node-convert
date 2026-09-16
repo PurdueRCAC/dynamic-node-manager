@@ -1,6 +1,8 @@
 #!/bin/bash
 set -Eeuo pipefail
 
+PROG="${0##*/}"
+
 CONVERT_TO=""
 NODE_NAME=""
 NODE_TYPE=""
@@ -8,6 +10,7 @@ NUM_NODES=""
 NAMESPACE=""
 LIST_ONLY=0
 SET_K8S="/usr/site/rcac/sbin/k8s-convert"
+MARKNODE="${MARKNODE:-/usr/site/rcac/scripts/marknode}"
 
 # Discover default search domain for FQDN pings (may be empty)
 NODE_SEARCH_DOMAIN="${NODE_SEARCH_DOMAIN:-$(hostname -d 2>/dev/null || true)}"
@@ -45,6 +48,32 @@ PREEMPT_DRAIN_TIMEOUT="${PREEMPT_DRAIN_TIMEOUT:-300}"
 # Preemption is opt-in per invocation: --allow-preempt or PREEMPT_ENABLED=1.
 ALLOW_PREEMPT="${PREEMPT_ENABLED:-0}"
 
+# ---------------- Diagnostics ----------------
+
+warn() { printf '%s\n' "$*" >&2; }
+die()  { warn "ERROR: $*"; exit 1; }
+
+# set -e aborts on any command that is not explicitly checked. Without this trap
+# that abort is silent, which is the worst possible outcome half way through a
+# conversion. Every deliberate failure path below prints its own message first;
+# this only catches the ones nobody thought of.
+on_err() {
+    local rc="$1" line="$2" cmd="$3"
+    warn "ERROR: ${PROG}: unchecked command failed (rc=${rc}) at line ${line}: ${cmd}"
+}
+trap 'on_err "$?" "$LINENO" "$BASH_COMMAND"' ERR
+
+# Fails early and by name rather than "command not found" mid-mutation.
+require_cmd() {
+    local c missing=()
+    for c in "$@"; do
+        command -v "$c" >/dev/null 2>&1 || missing+=("$c")
+    done
+    if ((${#missing[@]})); then
+        die "required command(s) not found: ${missing[*]}"
+    fi
+}
+
 usage() {
     cat <<EOF
 Usage: $0 --set <k8s|batch> [--node-name <name> | (--node-type a|b|g --num-nodes <num>)] [--namespace <ns>]
@@ -69,6 +98,9 @@ Environment overrides (both modes):
     PROTECT_LARGEST_PENDING  1 = refuse to convert if it would leave fewer viable
                              nodes than the largest pending job needs (default 0)
 
+Required for --set batch:
+    PASSWORD                 racadm password used to power cycle the node
+
 Preemption (only with --allow-preempt or PREEMPT_ENABLED=1):
     PREEMPT_USER             Job owner eligible for preemption (default x-ob)
     PREEMPT_ACCOUNT          Account eligible for preemption (default pur230002)
@@ -81,10 +113,19 @@ EOF
     exit 1
 }
 
+# marknode only leaves an operator note; the reservation is the real claim, so a
+# failure here is reported but does not stop the conversion.
 mark_node() {
     local node="$1"
     echo "Marking $node"
-    /usr/site/rcac/scripts/marknode -n "$node" -c "batch node selected for k8s conversion"
+    if [[ ! -x "$MARKNODE" ]]; then
+        warn "WARN: $MARKNODE is missing or not executable; skipping note for $node"
+        return 0
+    fi
+    if ! "$MARKNODE" -n "$node" -c "batch node selected for k8s conversion"; then
+        warn "WARN: marknode failed for $node; continuing"
+    fi
+    return 0
 }
 
 is_node_reachable() {
@@ -106,34 +147,71 @@ is_node_reachable() {
     return 1
 }
 
+# ---------------- Slurm query helpers ----------------
+
+# Expanding a hostlist that scontrol cannot parse must never look like "no
+# nodes": every caller decides for itself whether that is fatal.
+expand_hostlist() {
+    local hl="$1" out
+    if [[ -z "$hl" || "$hl" == "(null)" || "$hl" == "N/A" ]]; then
+        return 0
+    fi
+    if ! out="$(/usr/bin/scontrol show hostnames "$hl" 2>&1)"; then
+        warn "WARN: could not expand hostlist '${hl}': ${out}"
+        return 1
+    fi
+    printf '%s\n' "$out"
+}
+
 # ---------------- Slurm reservation helpers ----------------
 
+# 0 = exists, 1 = definitely absent, 2 = could not tell. "Could not tell" must
+# never be read as "absent": that sends res_add_nodes down the create path and
+# would rebuild the reservation from scratch around a single node.
 res_exists() {
-    /usr/bin/scontrol show reservation "$RES_NAME" >/dev/null 2>&1
+    local out
+    if out="$(/usr/bin/scontrol show reservation "$RES_NAME" 2>&1)"; then
+        return 0
+    fi
+    if printf '%s\n' "$out" | grep -qiE 'not found|invalid reservation|no reservation'; then
+        return 1
+    fi
+    warn "WARN: could not determine whether reservation ${RES_NAME} exists: ${out}"
+    return 2
 }
 
 res_get_nodes_hostlist() {
     # Must match the Nodes= key specifically. Splitting the whole record on '='
     # and taking field 2 yields the ReservationName value instead, which then
     # gets merged back in as a phantom node.
-    { /usr/bin/scontrol --oneliner show reservation "$RES_NAME" 2>/dev/null || true; } \
-      | grep -oE '(^| )Nodes=[^ ]+' | head -n1 | cut -d= -f2- || true
+    local out
+    if ! out="$(/usr/bin/scontrol --oneliner show reservation "$RES_NAME" 2>&1)"; then
+        warn "WARN: 'scontrol show reservation ${RES_NAME}' failed: ${out}"
+        return 1
+    fi
+    printf '%s\n' "$out" | grep -oE '(^| )Nodes=[^ ]+' | head -n1 | cut -d= -f2- || true
 }
 
+# Returns non-zero if the current membership could not be read. Callers must not
+# treat that as "the reservation is empty": rewriting it from a truncated list
+# would release nodes that are actively running Kubernetes.
 res_get_nodes_expanded() {
     local hostlist
-    hostlist="$(res_get_nodes_hostlist || true)"
+    hostlist="$(res_get_nodes_hostlist)" || return 1
     if [[ -z "${hostlist:-}" ]]; then
         return 0
     fi
-    /usr/bin/scontrol show hostnames "$hostlist"
+    expand_hostlist "$hostlist" || return 1
 }
 
 res_set_nodes_from_array() {
     local nodes=("$@")
     if ((${#nodes[@]} == 0)); then
         echo "Reservation $RES_NAME would be empty; deleting it."
-        /usr/bin/scontrol delete reservation "$RES_NAME"
+        if ! /usr/bin/scontrol delete reservation "$RES_NAME"; then
+            warn "ERROR: could not delete reservation ${RES_NAME}"
+            return 1
+        fi
         return 0
     fi
 
@@ -145,66 +223,110 @@ res_set_nodes_from_array() {
 
     # compress with hostlist that already exists
     local compressed
-    compressed="$(/usr/bin/scontrol show hostlist "$csv")"
+    if ! compressed="$(/usr/bin/scontrol show hostlist "$csv" 2>&1)"; then
+        warn "ERROR: could not compress node list '${csv}': ${compressed}"
+        return 1
+    fi
 
     echo "Updating reservation $RES_NAME nodes to: $compressed"
     # IGNORE_JOBS lets the reservation cover a node whose job we are about to
     # preempt; without it scontrol refuses because the node is busy.
-    /usr/bin/scontrol update ReservationName="$RES_NAME" Nodes="$compressed" Users="$RES_USERS" Accounts="$RES_ACCOUNTS" Flags=IGNORE_JOBS
+    if ! /usr/bin/scontrol update ReservationName="$RES_NAME" Nodes="$compressed" Users="$RES_USERS" Accounts="$RES_ACCOUNTS" Flags=IGNORE_JOBS; then
+        warn "ERROR: could not update reservation ${RES_NAME} to: ${compressed}"
+        return 1
+    fi
 }
 
 res_create_with_nodes() {
     local nodes_csv="$1"
     echo "Creating reservation $RES_NAME with nodes: $nodes_csv"
-    /usr/bin/scontrol create reservation \
+    if ! /usr/bin/scontrol create reservation \
         ReservationName="$RES_NAME" \
         StartTime=now Duration=INFINITE \
         Users=root Accounts=root \
         Flags=IGNORE_JOBS \
-        Nodes="$nodes_csv"
+        Nodes="$nodes_csv"; then
+        warn "ERROR: could not create reservation ${RES_NAME} with nodes: ${nodes_csv}"
+        return 1
+    fi
 }
 
 
 res_add_nodes() {
-    set -e
-
     local add_nodes=("$@")
 
-    if ! res_exists; then
+    if ((${#add_nodes[@]} == 0)); then
+        return 0
+    fi
+
+    local exists=0
+    res_exists || exists=$?
+    if (( exists == 2 )); then
+        warn "ERROR: cannot tell whether reservation ${RES_NAME} exists; refusing to touch it"
+        return 1
+    fi
+    if (( exists == 1 )); then
         # Create with provided nodes
         local csv
         csv="$(IFS=, ; echo "${add_nodes[*]}")"
-        res_create_with_nodes "$csv" || {
-            echo "Failed to create resource with nodes." >&2
-            kill $$
-        }
-        return
+        res_create_with_nodes "$csv" || return 1
+        return 0
     fi
 
-    # Merge with existing
-    mapfile -t existing < <(res_get_nodes_expanded || true)
-    local merged=("${existing[@]}" "${add_nodes[@]}")
+    # Merge with existing. A read failure here is fatal: continuing would rewrite
+    # the reservation with only the new nodes and hand every node already running
+    # Kubernetes back to the Slurm scheduler.
+    local existing_raw
+    if ! existing_raw="$(res_get_nodes_expanded)"; then
+        warn "ERROR: could not read current members of reservation ${RES_NAME}; refusing to rewrite it"
+        return 1
+    fi
 
-    res_set_nodes_from_array "${merged[@]}" || {
-        echo "Failed to set nodes from array." >&2
-        kill $$
-    }
+    local existing=()
+    if [[ -n "$existing_raw" ]]; then
+        mapfile -t existing <<<"$existing_raw"
+    fi
+
+    local merged=("${existing[@]}" "${add_nodes[@]}")
+    res_set_nodes_from_array "${merged[@]}" || return 1
 }
 
 
 res_remove_nodes() {
     # Remove nodes given as args; delete reservation if empty afterwards
     local del=("$@")
-    if ! res_exists; then
+    if ((${#del[@]} == 0)); then
+        return 0
+    fi
+    local exists=0
+    res_exists || exists=$?
+    if (( exists == 2 )); then
+        warn "ERROR: cannot tell whether reservation ${RES_NAME} exists; refusing to touch it"
+        return 1
+    fi
+    if (( exists == 1 )); then
         echo "Reservation $RES_NAME does not exist; nothing to remove."
         return 0
     fi
-    mapfile -t existing < <(res_get_nodes_expanded || true)
+
+    local existing_raw
+    if ! existing_raw="$(res_get_nodes_expanded)"; then
+        warn "ERROR: could not read current members of reservation ${RES_NAME}; refusing to rewrite or delete it"
+        return 1
+    fi
+
+    local existing=()
+    if [[ -n "$existing_raw" ]]; then
+        mapfile -t existing <<<"$existing_raw"
+    fi
 
     # If reservation has no nodes, delete it
     if ((${#existing[@]} == 0)); then
         echo "Reservation $RES_NAME has no nodes; deleting."
-        /usr/bin/scontrol delete reservation "$RES_NAME"
+        if ! /usr/bin/scontrol delete reservation "$RES_NAME"; then
+            warn "ERROR: could not delete empty reservation ${RES_NAME}"
+            return 1
+        fi
         return 0
     fi
 
@@ -220,9 +342,12 @@ res_remove_nodes() {
 
     if ((${#new_list[@]} == 0)); then
         echo "Last node(s) removed; deleting reservation $RES_NAME."
-        /usr/bin/scontrol delete reservation "$RES_NAME"
+        if ! /usr/bin/scontrol delete reservation "$RES_NAME"; then
+            warn "ERROR: could not delete reservation ${RES_NAME}"
+            return 1
+        fi
     else
-        res_set_nodes_from_array "${new_list[@]}"
+        res_set_nodes_from_array "${new_list[@]}" || return 1
     fi
 }
 
@@ -233,15 +358,24 @@ res_remove_nodes() {
 # Nodes the Slurm scheduler has already earmarked for a pending job, emitted as
 # "<node> <jobid>". Backfill publishes its plan as SchedNodes on the pending job;
 # those nodes sit IDLE on purpose while the job's other resources free up.
+#
+# A squeue failure is reported as a failure rather than as an empty plan: an
+# empty plan silently promotes earmarked nodes to "viable".
 planned_nodes() {
-    { /usr/bin/squeue --noheader --states=PENDING --Format=JobID:24,SchedNodes:2000 2>/dev/null || true; } \
+    local raw
+    if ! raw="$(/usr/bin/squeue --noheader --states=PENDING --Format=JobID:24,SchedNodes:2000 2>&1)"; then
+        warn "ERROR: 'squeue --states=PENDING' failed: ${raw}"
+        return 1
+    fi
+
+    printf '%s\n' "$raw" \
       | while read -r jid hl _; do
             if [[ -z "${hl:-}" || "$hl" == "(null)" || "$hl" == "N/A" ]]; then
                 continue
             fi
             while read -r n; do
                 [[ -n "$n" ]] && printf '%s %s\n' "$n" "$jid"
-            done < <(/usr/bin/scontrol show hostnames "$hl" 2>/dev/null || true)
+            done < <(expand_hostlist "$hl" || true)
         done
 }
 
@@ -249,11 +383,16 @@ planned_nodes() {
 # lookahead window, emitted as "<node> <reservation>". Our own k8s reservation
 # is excluded.
 reserved_nodes() {
-    local now horizon
+    local now horizon raw
     now="$(date +%s)"
     horizon=$(( now + RES_LOOKAHEAD_SECONDS ))
 
-    { /usr/bin/scontrol --oneliner show reservation 2>/dev/null || true; } \
+    if ! raw="$(/usr/bin/scontrol --oneliner show reservation 2>&1)"; then
+        warn "ERROR: 'scontrol show reservation' failed: ${raw}"
+        return 1
+    fi
+
+    printf '%s\n' "$raw" \
       | awk '
           {
             delete f
@@ -280,7 +419,7 @@ reserved_nodes() {
             fi
             while read -r n; do
                 [[ -n "$n" ]] && printf '%s %s\n' "$n" "$name"
-            done < <(/usr/bin/scontrol show hostnames "$nodes" 2>/dev/null || true)
+            done < <(expand_hostlist "$nodes" || true)
         done
 }
 
@@ -288,12 +427,17 @@ reserved_nodes() {
 #   <elapsed_seconds>|<jobid>|<numnodes>|<nodelist>
 # sorted youngest first, so preemption costs the least compute.
 preemptible_jobs() {
-    local now
+    local now raw
     now="$(date +%s)"
 
-    { /usr/bin/squeue --noheader --states=RUNNING \
+    if ! raw="$(/usr/bin/squeue --noheader --states=RUNNING \
         --user="$PREEMPT_USER" --account="$PREEMPT_ACCOUNT" \
-        --Format=JobID:24,NumNodes:12,StartTime:26,NodeList:2000 2>/dev/null || true; } \
+        --Format=JobID:24,NumNodes:12,StartTime:26,NodeList:2000 2>&1)"; then
+        warn "ERROR: 'squeue --states=RUNNING --user=${PREEMPT_USER}' failed: ${raw}"
+        return 1
+    fi
+
+    printf '%s\n' "$raw" \
       | while read -r jid nn st nl _; do
             if [[ -z "${nl:-}" || "$nl" == "(null)" || "$nl" == "N/A" ]]; then
                 continue
@@ -319,13 +463,20 @@ preemptible_jobs() {
 # node report. Multi-node jobs are carried through so the report can explain why
 # they are not preemptible, rather than leaving the node looking plain busy.
 preemptible_node_map() {
-    local elapsed jid nn nl human n
+    local elapsed jid nn nl human n jobs_raw
+    if ! jobs_raw="$(preemptible_jobs)"; then
+        return 1
+    fi
+    if [[ -z "$jobs_raw" ]]; then
+        return 0
+    fi
     while IFS='|' read -r elapsed jid nn nl; do
+        [[ -n "${jid:-}" ]] || continue
         human="$(fmt_duration "$elapsed")"
         while read -r n; do
             [[ -n "$n" ]] && printf '%s %s %s %s\n' "$n" "$jid" "$human" "$nn"
-        done < <(/usr/bin/scontrol show hostnames "$nl" 2>/dev/null || true)
-    done < <(preemptible_jobs)
+        done < <(expand_hostlist "$nl" || true)
+    done <<<"$jobs_raw"
 }
 
 # The preemptible workload is single-node by construction. Preempting a
@@ -335,9 +486,15 @@ job_is_single_node() {
     [[ "${1:-0}" == "1" ]]
 }
 
-# Largest node count requested by any pending job (0 if none / on error).
+# Largest node count requested by any pending job (0 if none). Returns non-zero
+# if the queue could not be read, so the pool guard can refuse to guess.
 largest_pending_nodecount() {
-    { /usr/bin/squeue --noheader --states=PENDING --Format=NumNodes:20 2>/dev/null || true; } \
+    local raw
+    if ! raw="$(/usr/bin/squeue --noheader --states=PENDING --Format=NumNodes:20 2>&1)"; then
+        warn "WARN: 'squeue --states=PENDING' failed: ${raw}"
+        return 1
+    fi
+    printf '%s\n' "$raw" \
       | awk '{ gsub(/[^0-9].*$/, "", $1); if ($1 + 0 > max) max = $1 + 0 } END { print max + 0 }'
 }
 
@@ -352,20 +509,43 @@ largest_pending_nodecount() {
 # job holding it belongs to the preemptible user+account and nothing else
 # (reservation, backfill plan) disqualifies the node. This is the single source
 # of truth for both --list and the conversion paths.
+#
+# Returns non-zero if any input could not be collected. A partial report would
+# mark nodes viable that the missing input would have excluded, so callers must
+# treat failure as "convert nothing".
 node_report() {
     local prefix="${1:-}"
     local now planned_file reserved_file preempt_file
+    local nodes_raw planned_raw reserved_raw preempt_raw
     now="$(date +%s)"
 
-    planned_file="$(mktemp)"
-    reserved_file="$(mktemp)"
-    preempt_file="$(mktemp)"
-    trap 'rm -f "$planned_file" "$reserved_file" "$preempt_file"' RETURN
-    planned_nodes        | awk 'NF' | sort -u -k1,1 > "$planned_file"
-    reserved_nodes       | awk 'NF' | sort -u -k1,1 > "$reserved_file"
-    preemptible_node_map | awk 'NF' | sort -u -k1,1 > "$preempt_file"
+    if ! nodes_raw="$(/usr/bin/scontrol --oneliner show nodes 2>&1)"; then
+        warn "ERROR: 'scontrol show nodes' failed: ${nodes_raw}"
+        return 1
+    fi
+    if ! planned_raw="$(planned_nodes)"; then
+        warn "ERROR: could not determine which nodes are planned for pending jobs"
+        return 1
+    fi
+    if ! reserved_raw="$(reserved_nodes)"; then
+        warn "ERROR: could not determine which nodes are reserved"
+        return 1
+    fi
+    if ! preempt_raw="$(preemptible_node_map)"; then
+        warn "ERROR: could not determine which nodes hold preemptible jobs"
+        return 1
+    fi
 
-    { /usr/bin/scontrol --oneliner show nodes 2>/dev/null || true; } \
+    planned_file="$(mktemp)" || { warn "ERROR: mktemp failed"; return 1; }
+    reserved_file="$(mktemp)" || { warn "ERROR: mktemp failed"; rm -f "$planned_file"; return 1; }
+    preempt_file="$(mktemp)" || { warn "ERROR: mktemp failed"; rm -f "$planned_file" "$reserved_file"; return 1; }
+    trap 'rm -f "$planned_file" "$reserved_file" "$preempt_file"' RETURN
+
+    printf '%s\n' "$planned_raw"  | awk 'NF' | sort -u -k1,1 > "$planned_file"
+    printf '%s\n' "$reserved_raw" | awk 'NF' | sort -u -k1,1 > "$reserved_file"
+    printf '%s\n' "$preempt_raw"  | awk 'NF' | sort -u -k1,1 > "$preempt_file"
+
+    printf '%s\n' "$nodes_raw" \
       | awk -v prefix="$prefix" -v planned="$planned_file" -v reserved="$reserved_file" \
             -v preempt="$preempt_file" -v puser="$PREEMPT_USER" -v pacct="$PREEMPT_ACCOUNT" \
             -v bad="$EXCLUDE_STATE_FLAGS" '
@@ -444,7 +624,7 @@ node_report() {
         done
 }
 
-# Prints eligible node names, longest-idle first.
+# Prints eligible node names, longest-idle first. Fails if the report does.
 select_eligible_nodes() {
     node_report "${1:-}" \
       | awk -F'|' '$4 == "OK" { print $3 "\t" $1 }' \
@@ -452,19 +632,24 @@ select_eligible_nodes() {
 }
 
 # Base state of a node with all flags stripped ("IDLE" from "IDLE+RESERVED").
+# Returns non-zero if Slurm could not be asked, which is not the same as a node
+# that is not idle.
 node_base_state() {
-    local st
-    st="$({ /usr/bin/scontrol --oneliner show node "$1" 2>/dev/null || true; } \
-          | grep -oE '(^| )State=[^ ]+' | head -n1 | cut -d= -f2 || true)"
+    local out st
+    if ! out="$(/usr/bin/scontrol --oneliner show node "$1" 2>&1)"; then
+        warn "WARN: 'scontrol show node $1' failed: ${out}"
+        return 1
+    fi
+    st="$(printf '%s\n' "$out" | grep -oE '(^| )State=[^ ]+' | head -n1 | cut -d= -f2 || true)"
     printf '%s' "${st%%+*}"
 }
 
 # Waits for a preempted node to finish COMPLETING and come back IDLE.
 wait_for_node_idle() {
-    local node="$1" deadline
+    local node="$1" deadline st
     deadline=$(( $(date +%s) + PREEMPT_DRAIN_TIMEOUT ))
     while (( $(date +%s) < deadline )); do
-        if [[ "$(node_base_state "$node")" == "IDLE" ]]; then
+        if st="$(node_base_state "$node")" && [[ "$st" == "IDLE" ]]; then
             return 0
         fi
         sleep 5
@@ -473,9 +658,13 @@ wait_for_node_idle() {
 }
 
 job_is_requeueable() {
-    local v
-    v="$({ /usr/bin/scontrol --oneliner show job "$1" 2>/dev/null || true; } \
-         | grep -oE '(^| )Requeue=[0-9]+' | head -n1 | cut -d= -f2 || true)"
+    local out v
+    if ! out="$(/usr/bin/scontrol --oneliner show job "$1" 2>&1)"; then
+        warn "WARN: 'scontrol show job $1' failed: ${out}"
+        # Unknown is not a licence to requeue something that cannot be requeued.
+        return 1
+    fi
+    v="$(printf '%s\n' "$out" | grep -oE '(^| )Requeue=[0-9]+' | head -n1 | cut -d= -f2 || true)"
     [[ "${v:-1}" != "0" ]]
 }
 
@@ -486,7 +675,7 @@ preempt_job() {
     local jid="$1" node="$2"
 
     if [[ "$PREEMPT_MODE" != "cancel" ]] && ! job_is_requeueable "$jid"; then
-        echo "PREEMPT: job $jid is not requeueable (Requeue=0); skipping. Set PREEMPT_MODE=cancel to kill it instead." >&2
+        echo "PREEMPT: job $jid is not requeueable (Requeue=0 or unreadable); skipping. Set PREEMPT_MODE=cancel to kill it instead." >&2
         return 1
     fi
 
@@ -501,7 +690,8 @@ preempt_job() {
 
     if (( PREEMPT_GRACE_SECONDS > 0 )); then
         echo "PREEMPT: sending TERM to job $jid, ${PREEMPT_GRACE_SECONDS}s grace" >&2
-        /usr/bin/scancel --signal=TERM --full "$jid" >&2 || true
+        /usr/bin/scancel --signal=TERM --full "$jid" >&2 \
+            || echo "PREEMPT: TERM to job $jid failed; continuing to ${PREEMPT_MODE}" >&2
         sleep "$PREEMPT_GRACE_SECONDS"
     fi
 
@@ -509,20 +699,27 @@ preempt_job() {
         echo "PREEMPT: cancelling job $jid ($PREEMPT_USER/$PREEMPT_ACCOUNT) on $node" >&2
         if ! /usr/bin/scancel "$jid" >&2; then
             echo "PREEMPT: scancel failed for job $jid; releasing reservation on $node" >&2
-            res_remove_nodes "$node" >&2 || true
+            res_remove_nodes "$node" >&2 \
+                || echo "PREEMPT: could not release $node from reservation $RES_NAME; remove it by hand" >&2
             return 1
         fi
     else
         echo "PREEMPT: requeueing job $jid ($PREEMPT_USER/$PREEMPT_ACCOUNT) on $node" >&2
         if ! /usr/bin/scontrol requeue "$jid" >&2; then
             echo "PREEMPT: requeue failed for job $jid; releasing reservation on $node" >&2
-            res_remove_nodes "$node" >&2 || true
+            res_remove_nodes "$node" >&2 \
+                || echo "PREEMPT: could not release $node from reservation $RES_NAME; remove it by hand" >&2
             return 1
         fi
     fi
 
     if ! wait_for_node_idle "$node"; then
         echo "PREEMPT: $node did not return to IDLE within ${PREEMPT_DRAIN_TIMEOUT}s" >&2
+        # The job is already gone. Holding the node in the reservation as well
+        # would leave it idle in neither pool, so hand it back to Slurm.
+        echo "PREEMPT: releasing the reservation on $node" >&2
+        res_remove_nodes "$node" >&2 \
+            || echo "PREEMPT: could not release $node from reservation $RES_NAME; remove it by hand" >&2
         return 1
     fi
 
@@ -530,13 +727,24 @@ preempt_job() {
 }
 
 # Preempts youngest-first until <want> nodes matching <prefix> are free.
-# Prints the freed node names.
+# Prints the freed node names. Returns non-zero only when the job list itself
+# could not be read; freeing fewer nodes than asked is reported by the caller.
 preempt_free_nodes() {
     local want="$1" prefix="${2:-}"
     local got=0 freed_all=()
-    local elapsed jid nn nl node
+    local elapsed jid nn nl node jobs_raw
+
+    if ! jobs_raw="$(preemptible_jobs)"; then
+        echo "PREEMPT: cannot list preemptible jobs; not preempting anything" >&2
+        return 1
+    fi
+    if [[ -z "$jobs_raw" ]]; then
+        echo "PREEMPT: no running ${PREEMPT_USER}/${PREEMPT_ACCOUNT} jobs to preempt" >&2
+        return 0
+    fi
 
     while IFS='|' read -r elapsed jid nn nl; do
+        [[ -n "${jid:-}" ]] || continue
         if (( got >= want )); then
             break
         fi
@@ -546,7 +754,7 @@ preempt_free_nodes() {
             continue
         fi
 
-        node="$(/usr/bin/scontrol show hostnames "$nl" 2>/dev/null | head -n1 || true)"
+        node="$(expand_hostlist "$nl" 2>/dev/null | head -n1 || true)"
         if [[ -z "$node" ]]; then
             echo "PREEMPT: job $jid has no expandable node list ('$nl'); skipping" >&2
             continue
@@ -568,7 +776,7 @@ preempt_free_nodes() {
             freed_all+=("$node")
             got=$(( got + 1 ))
         fi
-    done < <(preemptible_jobs)
+    done <<<"$jobs_raw"
 
     if ((${#freed_all[@]})); then
         printf '%s\n' "${freed_all[@]}"
@@ -578,15 +786,21 @@ preempt_free_nodes() {
 # Frees one specific node by preempting whichever preemptible job holds it.
 preempt_free_named_node() {
     local node="$1"
-    local elapsed jid nn nl jnode found=0 hit_jid="" hit_nn=""
+    local elapsed jid nn nl jnode found=0 hit_jid="" hit_nn="" jobs_raw
+
+    if ! jobs_raw="$(preemptible_jobs)"; then
+        echo "PREEMPT: cannot list preemptible jobs; not preempting anything" >&2
+        return 1
+    fi
 
     while IFS='|' read -r elapsed jid nn nl; do
-        jnode="$(/usr/bin/scontrol show hostnames "$nl" 2>/dev/null | grep -xF "$node" || true)"
+        [[ -n "${jid:-}" ]] || continue
+        jnode="$(expand_hostlist "$nl" 2>/dev/null | grep -xF "$node" || true)"
         if [[ -n "$jnode" ]]; then
             hit_jid="$jid"; hit_nn="$nn"; found=1
             break
         fi
-    done < <(preemptible_jobs)
+    done <<<"$jobs_raw"
 
     if (( found == 0 )); then
         echo "PREEMPT: no preemptible job ($PREEMPT_USER/$PREEMPT_ACCOUNT) is holding $node" >&2
@@ -604,7 +818,10 @@ preempt_free_named_node() {
 # Human-readable dump of every node and why it is or is not viable.
 list_viable_nodes() {
     local prefix="${1:-}" report ok_count preempt_count total largest
-    report="$(node_report "$prefix")"
+    if ! report="$(node_report "$prefix")"; then
+        warn "ERROR: could not build the node report; nothing to show"
+        return 1
+    fi
 
     printf '%-16s %-24s %12s  %-7s %s\n' "NODE" "STATE" "IDLE" "VERDICT" "REASON"
     if [[ -n "$report" ]]; then
@@ -634,7 +851,10 @@ list_viable_nodes() {
         echo "Preemption: disabled (pass --allow-preempt or set PREEMPT_ENABLED=1), would use mode=${PREEMPT_MODE}"
     fi
 
-    largest="$(largest_pending_nodecount)"
+    if ! largest="$(largest_pending_nodecount)"; then
+        echo "Largest pending job: unknown (could not read the pending queue)."
+        return 0
+    fi
     if (( largest > 0 )); then
         echo "Largest pending job requests ${largest} node(s)."
         if (( PROTECT_LARGEST_PENDING > 0 )); then
@@ -665,7 +885,11 @@ fmt_duration() {
 verify_still_idle() {
     local rc=0 n st
     for n in "$@"; do
-        st="$(node_base_state "$n")"
+        if ! st="$(node_base_state "$n")"; then
+            echo "RACE: could not read state of $n; treating it as unsafe" >&2
+            rc=1
+            continue
+        fi
         if [[ "$st" != "IDLE" ]]; then
             echo "RACE: $n is now State=${st:-unknown}; Slurm claimed it after selection" >&2
             rc=1
@@ -674,27 +898,128 @@ verify_still_idle() {
     return $rc
 }
 
+# ---------------- batch (k8s -> Slurm) helpers ----------------
+
+k8s_node_exists() {
+    kubectl get node "$1" >/dev/null 2>&1
+}
+
+# Drains and deletes the node from Kubernetes. A node that is already absent is
+# not an error; a drain we could not complete is, because deleting it anyway
+# would strand running pods.
+remove_node_from_k8s() {
+    local node="$1"
+    if ! k8s_node_exists "$node"; then
+        echo "WARN: $node is not registered in Kubernetes; skipping drain/delete" >&2
+        return 0
+    fi
+
+    echo "Draining $node from Kubernetes"
+    if ! kubectl drain --ignore-daemonsets --delete-emptydir-data --force "$node"; then
+        warn "ERROR: 'kubectl drain $node' failed; not deleting the node"
+        return 1
+    fi
+
+    if ! kubectl delete node "$node"; then
+        if k8s_node_exists "$node"; then
+            warn "ERROR: 'kubectl delete node $node' failed and the node is still registered"
+            return 1
+        fi
+        echo "WARN: delete reported an error but $node is gone from Kubernetes" >&2
+    fi
+    return 0
+}
+
+powercycle_node() {
+    local node="$1"
+    echo "Power cycling ${node} via mgmt/racadm"
+    if ! ssh mgmt /opt/dell/srvadmin/sbin/racadm -r "${node}.iron" --nocertwarn -u root -p "$PASSWORD" serveraction powercycle; then
+        warn "ERROR: power cycle failed for ${node}"
+        return 1
+    fi
+    echo "Server power operation initiated successfully for ${node}"
+}
+
+slurm_resume_node() {
+    local node="$1"
+    echo "SLURM RESUME: /usr/bin/scontrol update nodename=${node} state=resume"
+    if ! /usr/bin/scontrol update "nodename=${node}" state=resume; then
+        warn "ERROR: could not resume ${node} in Slurm"
+        return 1
+    fi
+    # Cosmetic: some Slurm versions reject Reason= on an already-resumed node.
+    /usr/bin/scontrol update "nodename=${node}" Reason="k8s-node reverted back to batch; ready for use." \
+        || warn "WARN: could not set the Reason note on ${node} (it is resumed regardless)"
+    return 0
+}
+
+# Full k8s -> batch conversion of one node. Each step gates the next: a node we
+# could not power cycle is never handed back to Slurm, and the caller leaves it
+# in the k8s reservation so no batch job lands on a half-converted machine.
+revert_node_to_batch() {
+    local node="$1"
+    echo "Converting $node back to batch"
+
+    if ! remove_node_from_k8s "$node"; then
+        warn "SKIP: ${node} was not removed from Kubernetes; leaving it reserved and out of Slurm"
+        return 1
+    fi
+    if ! powercycle_node "$node"; then
+        warn "SKIP: ${node} was not power cycled; NOT resuming it in Slurm and keeping it in reservation ${RES_NAME}"
+        return 1
+    fi
+    if ! slurm_resume_node "$node"; then
+        warn "SKIP: ${node} stays in reservation ${RES_NAME} until it is resumed by hand"
+        return 1
+    fi
+    return 0
+}
+
 # -----------------------------------------------------------
 
 # -------- arg parsing --------
 while [[ $# -gt 0 ]]; do
     key="$1"
     case $key in
-        --set)        CONVERT_TO="$2"; shift 2 ;;
-        --node-name)  NODE_NAME="$2";  shift 2 ;;
-        --node-type)  NODE_TYPE="$2";  shift 2 ;;
-        --num-nodes)  NUM_NODES="$2";  shift 2 ;;
-        --namespace)  NAMESPACE="$2";  shift 2 ;;
+        --set)
+            [[ $# -ge 2 ]] || { warn "Error: --set requires a value"; usage; }
+            CONVERT_TO="$2"; shift 2 ;;
+        --node-name)
+            [[ $# -ge 2 ]] || { warn "Error: --node-name requires a value"; usage; }
+            NODE_NAME="$2";  shift 2 ;;
+        --node-type)
+            [[ $# -ge 2 ]] || { warn "Error: --node-type requires a value"; usage; }
+            NODE_TYPE="$2";  shift 2 ;;
+        --num-nodes)
+            [[ $# -ge 2 ]] || { warn "Error: --num-nodes requires a value"; usage; }
+            NUM_NODES="$2";  shift 2 ;;
+        --namespace)
+            [[ $# -ge 2 ]] || { warn "Error: --namespace requires a value"; usage; }
+            NAMESPACE="$2";  shift 2 ;;
         --list)       LIST_ONLY=1;     shift ;;
         --allow-preempt) ALLOW_PREEMPT=1; shift ;;
         --help)       usage ;;
-        *)            usage ;;
+        *)            warn "Error: unknown argument '$key'"; usage ;;
     esac
 done
 
+# Node and namespace values are interpolated into pdsh/ssh command lines, so
+# they are checked for shape before anything is run with them.
+if [[ -n "$NODE_NAME" && ! "$NODE_NAME" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "invalid --node-name '${NODE_NAME}'"
+fi
+if [[ -n "$NODE_TYPE" && ! "$NODE_TYPE" =~ ^[A-Za-z][A-Za-z0-9]*$ ]]; then
+    die "invalid --node-type '${NODE_TYPE}' (expected a name prefix such as a, b or g)"
+fi
+if [[ -n "$NAMESPACE" && ! "$NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
+    die "invalid --namespace '${NAMESPACE}'"
+fi
+
+require_cmd /usr/bin/scontrol /usr/bin/squeue awk sort date mktemp
+
 # Read-only inspection mode: report and exit before any validation or mutation.
 if (( LIST_ONLY )); then
-    list_viable_nodes "${NODE_NAME:-${NODE_TYPE}}"
+    list_viable_nodes "${NODE_NAME:-${NODE_TYPE}}" || exit 1
     exit 0
 fi
 
@@ -709,18 +1034,52 @@ if [[ -n "$NODE_TYPE" && -z "$NUM_NODES" ]] || [[ -z "$NODE_TYPE" && -n "$NUM_NO
     echo "Error: Both --node-type and --num-nodes must be provided together." >&2
     usage
 fi
+
+if [[ -z "$NODE_NAME" && -z "$NODE_TYPE" ]]; then
+    echo "Error: either --node-name, or --node-type with --num-nodes, is required." >&2
+    usage
+fi
+
+if [[ -n "$NUM_NODES" && ! "$NUM_NODES" =~ ^[1-9][0-9]*$ ]]; then
+    echo "Error: --num-nodes must be a positive integer (got '${NUM_NODES}')." >&2
+    usage
+fi
 # -----------------------------
+
+# Everything the chosen mode needs, checked before the first mutation.
+case $CONVERT_TO in
+    k8s )
+        require_cmd pdsh ping
+        ;;
+    batch )
+        require_cmd kubectl ssh
+        # Only the --node-type/--num-nodes path picks nodes at random.
+        [[ -n "$NODE_NAME" ]] || require_cmd shuf
+        # Checked up front: reaching it unset after the node has already been
+        # drained and deleted loses the node from both Kubernetes and Slurm.
+        [[ -n "${PASSWORD:-}" ]] \
+            || die "PASSWORD is not set; it is required to power cycle nodes with racadm. Export PASSWORD before running --set batch."
+        ;;
+esac
 
 case $CONVERT_TO in
     k8s )
         # Multi-node
         if [[ -z "$NODE_NAME" ]]; then
-            mapfile -t candidates < <(select_eligible_nodes "$NODE_TYPE")
+            if ! candidates_raw="$(select_eligible_nodes "$NODE_TYPE")"; then
+                die "could not determine eligible nodes; converting nothing"
+            fi
+            candidates=()
+            if [[ -n "$candidates_raw" ]]; then
+                mapfile -t candidates <<<"$candidates_raw"
+            fi
 
             # The pool guard is judged on genuinely idle nodes, before any
             # preemption: if a big job is already starved, do not make it worse.
             if (( PROTECT_LARGEST_PENDING > 0 )); then
-                largest="$(largest_pending_nodecount)"
+                if ! largest="$(largest_pending_nodecount)"; then
+                    die "PROTECT_LARGEST_PENDING=1 but the pending queue could not be read; refusing to convert"
+                fi
                 if (( largest > 0 && ${#candidates[@]} - NUM_NODES < largest )); then
                     echo "Refusing to convert ${NUM_NODES} node(s): would leave $(( ${#candidates[@]} - NUM_NODES )) eligible idle node(s), below the largest pending job (${largest} nodes)" >&2
                     exit 1
@@ -732,8 +1091,13 @@ case $CONVERT_TO in
             if ((${#candidates[@]} < NUM_NODES)) && (( ALLOW_PREEMPT > 0 )); then
                 deficit=$(( NUM_NODES - ${#candidates[@]} ))
                 echo "Only ${#candidates[@]} idle node(s) of type '${NODE_TYPE}'; preempting up to ${deficit} more from ${PREEMPT_USER}/${PREEMPT_ACCOUNT} (mode=${PREEMPT_MODE})"
-                preempted=()
-                mapfile -t preempted < <(preempt_free_nodes "$deficit" "$NODE_TYPE")
+                freed_raw=""
+                if ! freed_raw="$(preempt_free_nodes "$deficit" "$NODE_TYPE")"; then
+                    echo "Preemption could not run" >&2
+                fi
+                if [[ -n "$freed_raw" ]]; then
+                    mapfile -t preempted <<<"$freed_raw"
+                fi
                 if ((${#preempted[@]})); then
                     echo "Preemption freed ${#preempted[@]} node(s): ${preempted[*]}"
                     candidates+=("${preempted[@]}")
@@ -769,7 +1133,8 @@ case $CONVERT_TO in
                 # the reservation where Slurm can never schedule them again.
                 if ((${#preempted[@]})); then
                     echo "Releasing preempted node(s) back to Slurm: ${preempted[*]}" >&2
-                    res_remove_nodes "${preempted[@]}" >&2 || true
+                    res_remove_nodes "${preempted[@]}" >&2 \
+                        || warn "WARN: could not release ${preempted[*]} from reservation ${RES_NAME}; remove them by hand"
                 fi
                 exit 1
             fi
@@ -782,20 +1147,32 @@ case $CONVERT_TO in
             nodes_csv="$(IFS=, ; echo "${reachable[*]}")"
 
             # ---- reservation: add nodes ----
-            res_add_nodes "${reachable[@]}"
+            if ! res_add_nodes "${reachable[@]}"; then
+                if ((${#preempted[@]})); then
+                    echo "Releasing preempted node(s) back to Slurm: ${preempted[*]}" >&2
+                    res_remove_nodes "${preempted[@]}" >&2 \
+                        || warn "WARN: could not release ${preempted[*]} from reservation ${RES_NAME}; remove them by hand"
+                fi
+                die "could not reserve ${reachable[*]}; nothing was converted"
+            fi
 
             # The reservation is the real claim; confirm nothing landed first.
             if ! verify_still_idle "${reachable[@]}"; then
                 echo "Rolling back reservation membership for: ${reachable[*]}" >&2
-                res_remove_nodes "${reachable[@]}"
+                res_remove_nodes "${reachable[@]}" \
+                    || warn "WARN: rollback failed; remove ${reachable[*]} from reservation ${RES_NAME} by hand"
                 exit 1
             fi
 
             # Pass namespace via env so k8s-convert/k8s-register can use it
-            pdsh -w "$nodes_csv" "env NAMESPACE='${NAMESPACE}' $SET_K8S"
-            rc=$?
+            rc=0
+            pdsh -w "$nodes_csv" "env NAMESPACE='${NAMESPACE}' $SET_K8S" || rc=$?
             if (( rc != 0 )); then
                 echo "pdsh failed with rc=$rc" >&2
+                # pdsh reports one rc for the whole set, so some nodes may be
+                # half converted. They stay reserved (out of Slurm's reach) on
+                # purpose; check the pdsh output above to see which failed.
+                echo "Node(s) ${reachable[*]} remain in reservation ${RES_NAME}. Inspect them, then run '${PROG} --set batch --node-name <node>' on any that did not convert." >&2
                 exit $rc
             fi
             for node in "${reachable[@]}"; do
@@ -804,7 +1181,13 @@ case $CONVERT_TO in
 
         # Single node
         else
-            verdict="$(node_report "$NODE_NAME" | awk -F'|' -v n="$NODE_NAME" '$1 == n { print $4; exit }')"
+            if ! report="$(node_report "$NODE_NAME")"; then
+                die "could not judge $NODE_NAME; converting nothing"
+            fi
+            verdict="$(printf '%s\n' "$report" | awk -F'|' -v n="$NODE_NAME" '$1 == n { print $4; exit }')"
+            if [[ -z "$verdict" ]]; then
+                die "$NODE_NAME is not a known Slurm node"
+            fi
             if [[ "$verdict" == "PREEMPT" && $ALLOW_PREEMPT -gt 0 ]]; then
                 echo "$NODE_NAME is held by a preemptible ${PREEMPT_USER}/${PREEMPT_ACCOUNT} job; preempting it (mode=${PREEMPT_MODE})"
                 if ! preempt_free_named_node "$NODE_NAME"; then
@@ -813,7 +1196,7 @@ case $CONVERT_TO in
                 fi
             elif [[ "$verdict" != "OK" ]]; then
                 echo "$NODE_NAME is not eligible: it must be IDLE with no PLANNED/RESERVED/DRAIN flag, idle for >= ${MIN_IDLE_SECONDS}s, and not planned for a pending job. Please pick another node." >&2
-                node_report "$NODE_NAME" | awk -F'|' -v n="$NODE_NAME" '$1 == n { print "  reason: " $5 }' >&2
+                printf '%s\n' "$report" | awk -F'|' -v n="$NODE_NAME" '$1 == n { print "  reason: " $5 }' >&2
                 if [[ "$verdict" == "PREEMPT" ]]; then
                     echo "  (pass --allow-preempt to preempt the job holding it)" >&2
                 fi
@@ -827,22 +1210,22 @@ case $CONVERT_TO in
             mark_node "$NODE_NAME"
 
             # ---- reservation: add node ----
-            res_add_nodes "$NODE_NAME"
+            res_add_nodes "$NODE_NAME" || die "could not reserve ${NODE_NAME}; nothing was converted"
 
             if ! verify_still_idle "$NODE_NAME"; then
                 echo "Rolling back reservation membership for: $NODE_NAME" >&2
-                res_remove_nodes "$NODE_NAME"
+                res_remove_nodes "$NODE_NAME" \
+                    || warn "WARN: rollback failed; remove ${NODE_NAME} from reservation ${RES_NAME} by hand"
                 exit 1
             fi
 
-            pdsh -w "$NODE_NAME" "env NAMESPACE='${NAMESPACE}' $SET_K8S"
-            rc=$?
+            rc=0
+            pdsh -w "$NODE_NAME" "env NAMESPACE='${NAMESPACE}' $SET_K8S" || rc=$?
             if (( rc != 0 )); then
                 echo "pdsh failed with rc=$rc for $NODE_NAME" >&2
+                echo "$NODE_NAME remains in reservation ${RES_NAME}. Inspect it, then run '${PROG} --set batch --node-name ${NODE_NAME}' to hand it back to Slurm." >&2
                 exit $rc
             fi
-
-
 
             echo "$NODE_NAME"
         fi
@@ -850,45 +1233,59 @@ case $CONVERT_TO in
     batch )
         # Multi-node
         if [[ -z "$NODE_NAME" ]]; then
-            mapfile -t nodes < <(
-                kubectl get nodes --no-headers \
+            if ! k8s_nodes_raw="$(kubectl get nodes --no-headers 2>&1)"; then
+                die "'kubectl get nodes' failed: ${k8s_nodes_raw}"
+            fi
+
+            nodes=()
+            selected="$(printf '%s\n' "$k8s_nodes_raw" \
                 | awk -v nt="$NODE_TYPE" '$1 ~ "^" nt "[0-9]{3}$" {print $1}' \
-                | shuf -n "${NUM_NODES}"
-            )
+                | shuf -n "${NUM_NODES}")"
+            if [[ -n "$selected" ]]; then
+                mapfile -t nodes <<<"$selected"
+            fi
 
             if ((${#nodes[@]} == 0)); then
-                echo "No nodes matched type '${NODE_TYPE}'" >&2
+                echo "No Kubernetes nodes matched type '${NODE_TYPE}'" >&2
                 exit 1
+            fi
+            if ((${#nodes[@]} < NUM_NODES)); then
+                echo "WARN: only ${#nodes[@]} node(s) of type '${NODE_TYPE}' are in Kubernetes (requested ${NUM_NODES}); reverting those" >&2
             fi
 
             echo "Converting these nodes back to batch: ${nodes[*]}"
 
-            kubectl drain --ignore-daemonsets --delete-emptydir-data --force "${nodes[@]}"
-            kubectl delete node "${nodes[@]}"
-
+            reverted=()
+            failed=()
             for node in "${nodes[@]}"; do
-                ssh mgmt /opt/dell/srvadmin/sbin/racadm -r "${node}.iron" --nocertwarn -u root -p "$PASSWORD" serveraction powercycle \
-                && echo "Server power operation initiated successfully for ${node}"
-                echo "SLURM RESUME: /usr/bin/scontrol update nodename=${node} state=resume"
-                /usr/bin/scontrol update "nodename=${node}" state=resume
+                if revert_node_to_batch "$node"; then
+                    reverted+=("$node")
+                else
+                    failed+=("$node")
+                fi
             done
 
             # ---- reservation: remove nodes (and delete res if last) ----
-            res_remove_nodes "${nodes[@]}"
+            # Only the nodes that made it all the way back to Slurm; the rest
+            # stay reserved so no batch job lands on them.
+            if ((${#reverted[@]})); then
+                res_remove_nodes "${reverted[@]}" \
+                    || die "reverted ${reverted[*]} but could not update reservation ${RES_NAME}; remove them by hand"
+            fi
+
+            if ((${#failed[@]})); then
+                die "failed to revert: ${failed[*]} (still held by reservation ${RES_NAME}; see the errors above)"
+            fi
 
         # Single node
         else
-            kubectl drain --ignore-daemonsets --delete-emptydir-data --force "$NODE_NAME"
-            kubectl delete node "$NODE_NAME"
-            echo "Converting $NODE_NAME back to batch"
-            ssh mgmt /opt/dell/srvadmin/sbin/racadm -r "${NODE_NAME}.iron" --nocertwarn -u root -p "$PASSWORD" serveraction powercycle \
-            && echo "Server power operation initiated successfully for ${NODE_NAME}"
-            echo "SLURM RESUME: /usr/bin/scontrol update nodename=${NODE_NAME} state=resume"
-            /usr/bin/scontrol update "nodename=${NODE_NAME}" state=resume
-            /usr/bin/scontrol update "nodename=${NODE_NAME}" Reason="k8s-node reverted back to batch; ready for use."
+            if ! revert_node_to_batch "$NODE_NAME"; then
+                die "failed to revert ${NODE_NAME} (still held by reservation ${RES_NAME}; see the errors above)"
+            fi
 
             # ---- reservation: remove node (and delete res if last) ----
-            res_remove_nodes "$NODE_NAME"
+            res_remove_nodes "$NODE_NAME" \
+                || die "reverted ${NODE_NAME} but could not update reservation ${RES_NAME}; remove it by hand"
         fi
     ;;
     * )

@@ -250,9 +250,32 @@ Environment overrides:
   that has run longer than this.
 - `PREEMPT_DRAIN_TIMEOUT` (default `300`) — how long to wait for a preempted
   node to reach `IDLE`.
+- `PASSWORD` (no default, **required for `--set batch`**) — the racadm password
+  used to power cycle a node on its way back to Slurm. `--set batch` refuses to
+  start without it, before anything is drained.
 
 Note: the `PLANNED` node state requires Slurm 22.05 or newer; on older versions
 the `SchedNodes` check carries most of the weight.
+
+### Failure handling
+
+Every external command (`scontrol`, `squeue`, `kubectl`, `pdsh`, `ssh`/racadm,
+`marknode`) is checked, and the script is built so that a failure never leaves a
+node in neither pool:
+
+- If Slurm or Kubernetes cannot be queried, nothing is converted. A node is
+  never judged viable on the strength of a query that failed — an unreadable
+  pending queue would otherwise make backfill-planned nodes look idle.
+- The `k8s` reservation is never rewritten from a membership list that could not
+  be read, and it is never deleted just because reading it failed.
+- If `pdsh` fails part way through, the affected nodes stay in the reservation
+  (and so out of Slurm's reach) and the script names them, rather than handing
+  half-converted machines back to the batch scheduler.
+- On the way back to batch, each step gates the next: a node that could not be
+  drained is not deleted, and a node that could not be power cycled is not
+  resumed in Slurm and keeps its reservation. In a multi-node revert the nodes
+  that succeeded are released normally and the failures are listed; the exit
+  status is non-zero if any node failed.
 
 ---
 
