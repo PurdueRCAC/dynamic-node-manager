@@ -1,4 +1,5 @@
 import os
+import sys
 import argparse
 import time
 import subprocess
@@ -36,15 +37,47 @@ DEFAULT_STATE_DIR = "/etc/dynamic-node"
 DEFAULT_NODE_CONVERT = "/usr/site/rcac/sbin/node-convert"
 
 
+def truthy(value, default=False):
+    if value is None:
+        return default
+    return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
 class SysLogger:
     """
     Thin wrapper around syslog so the rest of the code can log using .info/.warning/.error
     with printf-style formatting.
+
+    Syslog is always written, because that is what the systemd unit and everyone's
+    journalctl habits depend on. A console stream can be attached in addition, for
+    running in the foreground where tailing the journal to watch a dry run is
+    needlessly indirect. Attaching a console never detaches syslog: a validation
+    run stays as auditable as a production one.
     """
+
+    LEVEL_NAMES = {
+        syslog.LOG_INFO: "INFO",
+        syslog.LOG_WARNING: "WARN",
+        syslog.LOG_ERR: "ERROR",
+    }
 
     # Initializes syslog with an ident and facility.
     def __init__(self, ident="dynamic-node-manager", facility=syslog.LOG_DAEMON):
         syslog.openlog(ident=ident, logoption=syslog.LOG_PID, facility=facility)
+        self._console = None
+        # The evaluate loop and the actuator loop both log. syslog() is atomic
+        # per call; a bare stream write is not, and interleaved half-lines are
+        # exactly what you don't want while watching a conversion.
+        self._console_lock = Lock()
+
+    # Attaches (or with None, detaches) a stream that receives a copy of every
+    # message. Pass sys.stderr rather than sys.stdout so that --mode test's
+    # deployment name stays the only thing on stdout and remains pipeable.
+    def set_console(self, stream):
+        self._console = stream
+
+    def console_enabled(self):
+        return self._console is not None
 
     # Formats a message safely, falling back to string-joining if %-formatting fails.
     def _fmt(self, msg, *args):
@@ -54,20 +87,47 @@ class SysLogger:
             # fallback: join if formatting fails
             return " ".join([str(msg)] + [str(a) for a in args])
 
-    # Logs an informational message to syslog.
+    def _emit(self, priority, msg, *args):
+        text = self._fmt(msg, *args)
+        syslog.syslog(priority, text)
+        stream = self._console
+        if stream is None:
+            return
+        line = "%s %-5s %s\n" % (
+            datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+            self.LEVEL_NAMES.get(priority, "INFO"),
+            text,
+        )
+        try:
+            with self._console_lock:
+                stream.write(line)
+                # Unbuffered enough to be useful when piped to tee or a file.
+                stream.flush()
+        except Exception:
+            # Console logging is a convenience; never let a closed or broken
+            # stream take down a manager that is mid-conversion.
+            pass
+
+    # Logs an informational message to syslog, and to the console if attached.
     def info(self, msg, *args):
-        syslog.syslog(syslog.LOG_INFO, self._fmt(msg, *args))
+        self._emit(syslog.LOG_INFO, msg, *args)
 
-    # Logs a warning message to syslog.
+    # Logs a warning message to syslog, and to the console if attached.
     def warning(self, msg, *args):
-        syslog.syslog(syslog.LOG_WARNING, self._fmt(msg, *args))
+        self._emit(syslog.LOG_WARNING, msg, *args)
 
-    # Logs an error message to syslog.
+    # Logs an error message to syslog, and to the console if attached.
     def error(self, msg, *args):
-        syslog.syslog(syslog.LOG_ERR, self._fmt(msg, *args))
+        self._emit(syslog.LOG_ERR, msg, *args)
 
 
 logger = SysLogger()
+
+# Console logging has to be settable before any config is read, because config
+# resolution itself logs. $DNM_LOG_CONSOLE covers that window; --log-console and
+# the log_console ini key are applied later and are equivalent.
+if truthy(os.environ.get("DNM_LOG_CONSOLE")):
+    logger.set_console(sys.stderr)
 
 
 # Resolves a path written in the config file. Expands ~ and $VARS, which
@@ -119,6 +179,15 @@ class DynamicNodeManager:
         # the ini, not the process cwd. See expand_path.
         self.config_dir = os.path.dirname(self.config_path)
         config_dir = self.config_dir
+
+        # Mirror logging to stderr as well as syslog. Applied as early as
+        # possible so the startup banner and any config error are visible. An
+        # already-attached console (--log-console or $DNM_LOG_CONSOLE) wins, so
+        # the flag can always turn this on but the ini cannot turn it off.
+        if not logger.console_enabled() and truthy(
+            config_data.get("settings", "log_console", fallback=None)
+        ):
+            logger.set_console(sys.stderr)
 
         # Identifies this instance in logs and in the converted-node registry. A
         # non-default value is what keeps a validation instance from reverting
@@ -1328,7 +1397,20 @@ if __name__ == "__main__":
             "or writing anything."
         ),
     )
+    parser.add_argument(
+        "--log-console",
+        action="store_true",
+        help=(
+            "Also write log output to stderr, in addition to syslog. Equivalent "
+            "to DNM_LOG_CONSOLE=1 or log_console = true in the ini. Syslog is "
+            "never disabled. Includes node-convert's own output, which the "
+            "manager relays line by line."
+        ),
+    )
     args = parser.parse_args()
+
+    if args.log_console:
+        logger.set_console(sys.stderr)
 
     mgr = DynamicNodeManager(config_path=args.config, dry_run=args.dry_run)
 
