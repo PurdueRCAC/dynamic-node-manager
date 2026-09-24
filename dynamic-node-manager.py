@@ -70,12 +70,21 @@ class SysLogger:
 logger = SysLogger()
 
 
-# Expands ~ and $VARS so config values can be written relative to a home
-# directory. configparser does neither on its own.
-def expand_path(path):
+# Resolves a path written in the config file. Expands ~ and $VARS, which
+# configparser does not do on its own, and then resolves anything still relative
+# against <base> rather than the process working directory.
+#
+# Resolving against the config file's own directory is what lets a git checkout
+# be self-contained: the ini can say `state_dir = state` and mean "next to this
+# file", so the same checkout works from any cwd and for any user. Absolute
+# values are returned untouched, which is why production's config is unaffected.
+def expand_path(path, base=None):
     if not path:
         return path
-    return os.path.expanduser(os.path.expandvars(str(path).strip()))
+    p = os.path.expanduser(os.path.expandvars(str(path).strip()))
+    if base and not os.path.isabs(p):
+        p = os.path.join(base, p)
+    return os.path.normpath(p)
 
 
 # Loads the INI configuration file from disk and returns a ConfigParser instance.
@@ -103,8 +112,13 @@ class DynamicNodeManager:
     # Initializes the manager: loads config, kubeconfig, API clients, and runtime settings.
     def __init__(self, config_path=None, dry_run=False):
         config_data, resolved_config_path = load_config(config_path)
-        self.config_path = resolved_config_path
+        self.config_path = os.path.abspath(resolved_config_path)
         self.dry_run = bool(dry_run)
+
+        # Relative paths in the ini are resolved against the directory holding
+        # the ini, not the process cwd. See expand_path.
+        self.config_dir = os.path.dirname(self.config_path)
+        config_dir = self.config_dir
 
         # Identifies this instance in logs and in the converted-node registry. A
         # non-default value is what keeps a validation instance from reverting
@@ -117,7 +131,7 @@ class DynamicNodeManager:
         # be handed the same kubeconfig, otherwise the manager and the converter
         # can end up talking to different clusters.
         self.kubeconfig_path = expand_path(
-            config_data.get("settings", "kubeconfig_path", fallback=None)
+            config_data.get("settings", "kubeconfig_path", fallback=None), config_dir
         )
         kubeconfig_path = self.kubeconfig_path
         try:
@@ -154,7 +168,8 @@ class DynamicNodeManager:
         # state_dir is the per-instance home for mutable state. Two instances
         # sharing one converted_nodes.json will revert each other's nodes.
         self.state_dir = expand_path(
-            config_data.get("settings", "state_dir", fallback=DEFAULT_STATE_DIR)
+            config_data.get("settings", "state_dir", fallback=DEFAULT_STATE_DIR),
+            config_dir,
         )
 
         # Previously hardcoded, which silently ignored the namespace_queue_paths
@@ -164,7 +179,8 @@ class DynamicNodeManager:
                 "settings",
                 "namespace_queue_paths",
                 fallback=os.path.join(DEFAULT_STATE_DIR, "namespace_queue_paths.json"),
-            )
+            ),
+            config_dir,
         )
         try:
             with open(self.namespace_queue_paths_file, "r") as f:
@@ -187,12 +203,14 @@ class DynamicNodeManager:
                 "settings",
                 "converted_nodes_path",
                 fallback=os.path.join(self.state_dir, "converted_nodes.json"),
-            )
+            ),
+            config_dir,
         )
         self.node_convert_path = expand_path(
             config_data.get(
                 "settings", "node_convert_path", fallback=DEFAULT_NODE_CONVERT
-            )
+            ),
+            config_dir,
         )
         # Slurm node type offered to node-convert. Pointing a validation instance
         # at a dedicated node type is what keeps it off production hardware.
