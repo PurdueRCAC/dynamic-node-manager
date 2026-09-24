@@ -10,7 +10,7 @@ NUM_NODES=""
 NAMESPACE=""
 LIST_ONLY=0
 SET_K8S="/usr/site/rcac/sbin/k8s-convert"
-MARKNODE="${MARKNODE:-/usr/site/rcac/scripts/marknode}"
+MARK_REASON="${MARK_REASON:-batch node selected for k8s conversion}"
 
 # Discover default search domain for FQDN pings (may be empty)
 NODE_SEARCH_DOMAIN="${NODE_SEARCH_DOMAIN:-$(hostname -d 2>/dev/null || true)}"
@@ -97,6 +97,9 @@ Environment overrides (both modes):
                              blocking (default 86400)
     PROTECT_LARGEST_PENDING  1 = refuse to convert if it would leave fewer viable
                              nodes than the largest pending job needs (default 0)
+    MARK_REASON              Slurm Reason recorded on a node drained for
+                             conversion; shows up in 'sinfo -R'
+                             (default "batch node selected for k8s conversion")
 
 Required for --set batch:
     PASSWORD                 racadm password used to power cycle the node
@@ -113,17 +116,33 @@ EOF
     exit 1
 }
 
-# marknode only leaves an operator note; the reservation is the real claim, so a
-# failure here is reported but does not stop the conversion.
+# Drains the node with a Reason, so the note stays visible in 'sinfo -R' for as
+# long as the node is out of the batch pool: a reservation carries no per-node
+# explanation of its own. Slurm only keeps a Reason on a node that is out of
+# service, which is why this drains rather than annotating in place. The
+# reservation is still the real claim, so a failure here is reported but does
+# not stop the conversion.
 mark_node() {
     local node="$1"
     echo "Marking $node"
-    if [[ ! -x "$MARKNODE" ]]; then
-        warn "WARN: $MARKNODE is missing or not executable; skipping note for $node"
-        return 0
+    if ! /usr/bin/scontrol update "nodename=${node}" state=drain \
+            reason="${MARK_REASON}"; then
+        warn "WARN: could not drain ${node}; continuing"
     fi
-    if ! "$MARKNODE" -n "$node" -c "batch node selected for k8s conversion"; then
-        warn "WARN: marknode failed for $node; continuing"
+    return 0
+}
+
+# Undoes mark_node. Every rollback that hands a marked node back to Slurm must
+# call this: releasing the reservation alone leaves the node DRAIN, and because
+# DRAIN is in EXCLUDE_STATE_FLAGS it would never be selected again either, so
+# the node falls silently out of both pools. Safe on a node that has since been
+# claimed by a job -- resume clears the drain flag without touching the job.
+# Best effort like mark_node: a rollback path must not abort on cleanup.
+unmark_node() {
+    local node="$1"
+    echo "Unmarking $node"
+    if ! /usr/bin/scontrol update "nodename=${node}" state=resume; then
+        warn "WARN: could not clear the drain on ${node}; resume it by hand"
     fi
     return 0
 }
@@ -1148,6 +1167,9 @@ case $CONVERT_TO in
 
             # ---- reservation: add nodes ----
             if ! res_add_nodes "${reachable[@]}"; then
+                for node in "${reachable[@]}"; do
+                    unmark_node "$node"
+                done
                 if ((${#preempted[@]})); then
                     echo "Releasing preempted node(s) back to Slurm: ${preempted[*]}" >&2
                     res_remove_nodes "${preempted[@]}" >&2 \
@@ -1161,6 +1183,9 @@ case $CONVERT_TO in
                 echo "Rolling back reservation membership for: ${reachable[*]}" >&2
                 res_remove_nodes "${reachable[@]}" \
                     || warn "WARN: rollback failed; remove ${reachable[*]} from reservation ${RES_NAME} by hand"
+                for node in "${reachable[@]}"; do
+                    unmark_node "$node"
+                done
                 exit 1
             fi
 
@@ -1170,9 +1195,10 @@ case $CONVERT_TO in
             if (( rc != 0 )); then
                 echo "pdsh failed with rc=$rc" >&2
                 # pdsh reports one rc for the whole set, so some nodes may be
-                # half converted. They stay reserved (out of Slurm's reach) on
-                # purpose; check the pdsh output above to see which failed.
-                echo "Node(s) ${reachable[*]} remain in reservation ${RES_NAME}. Inspect them, then run '${PROG} --set batch --node-name <node>' on any that did not convert." >&2
+                # half converted. They stay reserved and drained (out of Slurm's
+                # reach) on purpose; check the pdsh output above to see which
+                # failed.
+                echo "Node(s) ${reachable[*]} remain drained and in reservation ${RES_NAME}. Inspect them, then run '${PROG} --set batch --node-name <node>' on any that did not convert." >&2
                 exit $rc
             fi
             for node in "${reachable[@]}"; do
@@ -1210,12 +1236,16 @@ case $CONVERT_TO in
             mark_node "$NODE_NAME"
 
             # ---- reservation: add node ----
-            res_add_nodes "$NODE_NAME" || die "could not reserve ${NODE_NAME}; nothing was converted"
+            if ! res_add_nodes "$NODE_NAME"; then
+                unmark_node "$NODE_NAME"
+                die "could not reserve ${NODE_NAME}; nothing was converted"
+            fi
 
             if ! verify_still_idle "$NODE_NAME"; then
                 echo "Rolling back reservation membership for: $NODE_NAME" >&2
                 res_remove_nodes "$NODE_NAME" \
                     || warn "WARN: rollback failed; remove ${NODE_NAME} from reservation ${RES_NAME} by hand"
+                unmark_node "$NODE_NAME"
                 exit 1
             fi
 
@@ -1223,7 +1253,7 @@ case $CONVERT_TO in
             pdsh -w "$NODE_NAME" "env NAMESPACE='${NAMESPACE}' $SET_K8S" || rc=$?
             if (( rc != 0 )); then
                 echo "pdsh failed with rc=$rc for $NODE_NAME" >&2
-                echo "$NODE_NAME remains in reservation ${RES_NAME}. Inspect it, then run '${PROG} --set batch --node-name ${NODE_NAME}' to hand it back to Slurm." >&2
+                echo "$NODE_NAME remains drained and in reservation ${RES_NAME}. Inspect it, then run '${PROG} --set batch --node-name ${NODE_NAME}' to hand it back to Slurm." >&2
                 exit $rc
             fi
 

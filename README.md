@@ -259,18 +259,25 @@ the `SchedNodes` check carries most of the weight.
 
 ### Failure handling
 
-Every external command (`scontrol`, `squeue`, `kubectl`, `pdsh`, `ssh`/racadm,
-`marknode`) is checked, and the script is built so that a failure never leaves a
-node in neither pool:
+Every external command (`scontrol`, `squeue`, `kubectl`, `pdsh`, `ssh`/racadm)
+is checked, and the script is built so that a failure never leaves a node in
+neither pool:
 
 - If Slurm or Kubernetes cannot be queried, nothing is converted. A node is
   never judged viable on the strength of a query that failed — an unreadable
   pending queue would otherwise make backfill-planned nodes look idle.
 - The `k8s` reservation is never rewritten from a membership list that could not
   be read, and it is never deleted just because reading it failed.
-- If `pdsh` fails part way through, the affected nodes stay in the reservation
-  (and so out of Slurm's reach) and the script names them, rather than handing
-  half-converted machines back to the batch scheduler.
+- If `pdsh` fails part way through, the affected nodes stay drained and in the
+  reservation (and so out of Slurm's reach) and the script names them, rather
+  than handing half-converted machines back to the batch scheduler.
+- Selected nodes are drained with a `Reason` (`MARK_REASON`, default `batch node
+  selected for k8s conversion`) so `sinfo -R` explains why they left the batch
+  pool — a reservation carries no per-node note of its own, and Slurm only keeps
+  a `Reason` on a node that is out of service. Any rollback that releases the
+  reservation also clears the drain — otherwise the node would be neither
+  reserved nor schedulable, and `DRAIN` would keep it out of future selection
+  too.
 - On the way back to batch, each step gates the next: a node that could not be
   drained is not deleted, and a node that could not be power cycled is not
   resumed in Slurm and keeps its reservation. In a multi-node revert the nodes
