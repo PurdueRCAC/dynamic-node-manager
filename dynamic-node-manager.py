@@ -29,6 +29,12 @@ NAMESPACE_MARK_TAINT_EFFECT = "NoSchedule"
 PENDING_CONVERSIONS = []
 PENDING_LOCK = Lock()
 
+# Default locations. Every one of these can be overridden per instance so that a
+# validation instance can run alongside production without sharing state.
+DEFAULT_CONFIG_PATH = "/etc/dynamic-node/dynamic_node_config.ini"
+DEFAULT_STATE_DIR = "/etc/dynamic-node"
+DEFAULT_NODE_CONVERT = "/usr/site/rcac/sbin/node-convert"
+
 
 class SysLogger:
     """
@@ -64,11 +70,23 @@ class SysLogger:
 logger = SysLogger()
 
 
+# Expands ~ and $VARS so config values can be written relative to a home
+# directory. configparser does neither on its own.
+def expand_path(path):
+    if not path:
+        return path
+    return os.path.expanduser(os.path.expandvars(str(path).strip()))
+
+
 # Loads the INI configuration file from disk and returns a ConfigParser instance.
-def load_config(path="/etc/dynamic-node/dynamic_node_config.ini"):
+# Resolution order: explicit argument, then $DNM_CONFIG, then the production default.
+def load_config(path=None):
+    path = expand_path(path or os.environ.get("DNM_CONFIG") or DEFAULT_CONFIG_PATH)
     cfg = configparser.ConfigParser()
-    cfg.read(path)
-    return cfg
+    read_ok = cfg.read(path)
+    if not read_ok:
+        raise FileNotFoundError(f"Config file not found or unreadable: {path}")
+    return cfg, path
 
 
 class DynamicNodeManager:
@@ -83,10 +101,25 @@ class DynamicNodeManager:
     """
 
     # Initializes the manager: loads config, kubeconfig, API clients, and runtime settings.
-    def __init__(self):
-        config_data = load_config()
+    def __init__(self, config_path=None, dry_run=False):
+        config_data, resolved_config_path = load_config(config_path)
+        self.config_path = resolved_config_path
+        self.dry_run = bool(dry_run)
 
-        kubeconfig_path = config_data.get("settings", "kubeconfig_path", fallback=None)
+        # Identifies this instance in logs and in the converted-node registry. A
+        # non-default value is what keeps a validation instance from reverting
+        # nodes that production converted.
+        self.instance_id = str(
+            config_data.get("settings", "instance_id", fallback="prod")
+        ).strip()
+
+        # Retained on the instance: node-convert shells out to kubectl and must
+        # be handed the same kubeconfig, otherwise the manager and the converter
+        # can end up talking to different clusters.
+        self.kubeconfig_path = expand_path(
+            config_data.get("settings", "kubeconfig_path", fallback=None)
+        )
+        kubeconfig_path = self.kubeconfig_path
         try:
             if kubeconfig_path:
                 config.load_kube_config(config_file=kubeconfig_path)
@@ -118,15 +151,54 @@ class DynamicNodeManager:
         self.cm_name = config_data.get(
             "settings", "yunikorn_cm_name", fallback="yunikorn-configs"
         )
-        self.namespace_queue_paths = json.load(
-            open("/etc/dynamic-node/namespace_queue_paths.json", "r")
+        # state_dir is the per-instance home for mutable state. Two instances
+        # sharing one converted_nodes.json will revert each other's nodes.
+        self.state_dir = expand_path(
+            config_data.get("settings", "state_dir", fallback=DEFAULT_STATE_DIR)
         )
+
+        # Previously hardcoded, which silently ignored the namespace_queue_paths
+        # key that already existed in the ini file.
+        self.namespace_queue_paths_file = expand_path(
+            config_data.get(
+                "settings",
+                "namespace_queue_paths",
+                fallback=os.path.join(DEFAULT_STATE_DIR, "namespace_queue_paths.json"),
+            )
+        )
+        try:
+            with open(self.namespace_queue_paths_file, "r") as f:
+                self.namespace_queue_paths = json.load(f)
+        except Exception as e:
+            logger.error(
+                "Failed to read namespace_queue_paths from %s: %s",
+                self.namespace_queue_paths_file,
+                e,
+            )
+            raise
+
         self.yk_queue_annotation = config_data.get(
             "settings",
             "yunikorn_queue_annotation",
             fallback="yunikorn.apache.org/queue",
         )
-        self.converted_nodes_path = "/etc/dynamic-node/converted_nodes.json"
+        self.converted_nodes_path = expand_path(
+            config_data.get(
+                "settings",
+                "converted_nodes_path",
+                fallback=os.path.join(self.state_dir, "converted_nodes.json"),
+            )
+        )
+        self.node_convert_path = expand_path(
+            config_data.get(
+                "settings", "node_convert_path", fallback=DEFAULT_NODE_CONVERT
+            )
+        )
+        # Slurm node type offered to node-convert. Pointing a validation instance
+        # at a dedicated node type is what keeps it off production hardware.
+        self.node_type = str(
+            config_data.get("settings", "node_type", fallback="a")
+        ).strip()
         self.converted_nodes = self.load_converted_nodes()
         self.node_vcores = int(config_data.get("settings", "node_cpu_capacity", fallback="128"))
         self.node_mem_bytes = self._parse_mem(
@@ -152,6 +224,82 @@ class DynamicNodeManager:
             logger.warning(
                 "allow_preempt is enabled: conversions may preempt running batch jobs"
             )
+
+        # Queue subtrees this instance is permitted to modify. Empty means
+        # unrestricted, which is the historical behaviour. A validation instance
+        # sharing production's queues.yaml should always set this.
+        self.allowed_queue_prefixes = [
+            s.strip()
+            for s in str(
+                config_data.get("settings", "allowed_queue_prefixes", fallback="")
+            ).split(",")
+            if s.strip()
+        ]
+
+        self._preflight()
+
+    # Fails fast on configuration that would let this instance act outside its
+    # own blast radius. Runs before any loop starts.
+    def _preflight(self):
+        problems = []
+
+        for ns in self.monitored_namespaces:
+            qp = self.namespace_queue_paths.get(ns)
+            if not qp:
+                problems.append(
+                    f"monitored namespace '{ns}' has no entry in {self.namespace_queue_paths_file}"
+                )
+            elif not self._queue_allowed(qp):
+                problems.append(
+                    f"namespace '{ns}' maps to queue '{qp}', outside allowed_queue_prefixes "
+                    f"{self.allowed_queue_prefixes}"
+                )
+
+        if problems:
+            for p in problems:
+                logger.error("Preflight failure: %s", p)
+            raise SystemExit(
+                "Refusing to start; "
+                + "; ".join(problems)
+            )
+
+        logger.info(
+            "Instance '%s' starting: config=%s state=%s node_type=%s "
+            "queues=%s cm=%s/%s dry_run=%s max_converted=%d",
+            self.instance_id,
+            self.config_path,
+            self.converted_nodes_path,
+            self.node_type,
+            self.allowed_queue_prefixes or "<unrestricted>",
+            self.cm_ns,
+            self.cm_name,
+            self.dry_run,
+            self.max_converted_nodes,
+        )
+
+    # Environment handed to node-convert. It shells out to kubectl, so it needs
+    # the same kubeconfig this process loaded rather than whatever happens to be
+    # in the ambient environment.
+    def _subprocess_env(self):
+        env = os.environ.copy()
+        if self.kubeconfig_path:
+            env["KUBECONFIG"] = self.kubeconfig_path
+        else:
+            env["KUBECONFIG"] = os.environ.get(
+                "KUBECONFIG", os.path.expanduser("~/.kube/config")
+            )
+        return env
+
+    # True if queue_path falls inside one of the permitted subtrees.
+    def _queue_allowed(self, queue_path: str) -> bool:
+        if not self.allowed_queue_prefixes:
+            return True
+        if not queue_path:
+            return False
+        return any(
+            queue_path == p or queue_path.startswith(p + ".")
+            for p in self.allowed_queue_prefixes
+        )
 
     # Scans live Kubernetes nodes and counts which ones look "converted" into a namespace pool.
     # Returns: (total_converted, per_namespace_breakdown).
@@ -308,40 +456,91 @@ class DynamicNodeManager:
         """
         Adjust queue capacity by <nodes> * (node_vcores, node_mem_bytes).
         Positive nodes => increase; negative => decrease.
+
+        queues.yaml is one opaque string inside the ConfigMap, so every edit is a
+        read-modify-write of the entire document no matter which verb is used.
+        The write is therefore guarded by the resourceVersion read alongside it.
+        Without that, two managers sharing one queues.yaml silently clobber each
+        other's edits to unrelated queues.
         """
-        queues_obj, cm = self._get_queues_yaml()
-        q = self._find_queue(queues_obj, queue_path)
+        if not self._queue_allowed(queue_path):
+            raise PermissionError(
+                f"Instance '{self.instance_id}' may not modify queue '{queue_path}'; "
+                f"allowed prefixes: {self.allowed_queue_prefixes}"
+            )
 
-        v_delta = self.node_vcores * int(nodes)
-        m_delta_bytes = self.node_mem_bytes * int(nodes)
+        WRITE_ATTEMPTS = 5
 
-        res = self._get_set(q, "resources", default_factory=dict)
-        mx = self._get_set(res, "max", default_factory=dict)
-        gr = self._get_set(res, "guaranteed", default_factory=dict)
+        for attempt in range(1, WRITE_ATTEMPTS + 1):
+            queues_obj, cm = self._get_queues_yaml()
+            q = self._find_queue(queues_obj, queue_path)
 
-        def bump(section: dict):
-            old_v = int(str(section.get("vcore", "0")) or 0)
-            new_v = max(0, old_v + v_delta)
-            old_m_str = str(section.get("memory", "0G"))
-            old_m_bytes = self._parse_mem(old_m_str)
-            new_m_bytes = max(0, old_m_bytes + m_delta_bytes)
-            new_m_str = self._format_mem_like(new_m_bytes, old_m_str)
+            v_delta = self.node_vcores * int(nodes)
+            m_delta_bytes = self.node_mem_bytes * int(nodes)
 
-            section["vcore"] = new_v
-            section["memory"] = new_m_str
-            return old_v, new_v, old_m_str, new_m_str, new_m_bytes
+            res = self._get_set(q, "resources", default_factory=dict)
+            mx = self._get_set(res, "max", default_factory=dict)
+            gr = self._get_set(res, "guaranteed", default_factory=dict)
 
-        old_v_max, new_v_max, old_m_max_str, new_m_max_str, new_m_max_bytes = bump(mx)
-        old_v_g, new_v_g, old_m_g_str, new_m_g_str, new_m_g_bytes = bump(gr)
+            def bump(section: dict):
+                old_v = int(str(section.get("vcore", "0")) or 0)
+                new_v = max(0, old_v + v_delta)
+                old_m_str = str(section.get("memory", "0G"))
+                old_m_bytes = self._parse_mem(old_m_str)
+                new_m_bytes = max(0, old_m_bytes + m_delta_bytes)
+                new_m_str = self._format_mem_like(new_m_bytes, old_m_str)
 
-        if new_v_g > new_v_max:
-            gr["vcore"] = new_v_max
-        if new_m_g_bytes > new_m_max_bytes:
-            gr["memory"] = self._format_mem_like(new_m_max_bytes, old_m_g_str)
+                section["vcore"] = new_v
+                section["memory"] = new_m_str
+                return old_v, new_v, old_m_str, new_m_str, new_m_bytes
 
-        new_text = yaml.safe_dump(queues_obj, sort_keys=False)
-        body = {"data": {"queues.yaml": new_text}}
-        self.v1.patch_namespaced_config_map(self.cm_name, self.cm_ns, body)
+            old_v_max, new_v_max, old_m_max_str, new_m_max_str, new_m_max_bytes = bump(mx)
+            old_v_g, new_v_g, old_m_g_str, new_m_g_str, new_m_g_bytes = bump(gr)
+
+            if new_v_g > new_v_max:
+                gr["vcore"] = new_v_max
+            if new_m_g_bytes > new_m_max_bytes:
+                gr["memory"] = self._format_mem_like(new_m_max_bytes, old_m_g_str)
+
+            new_text = yaml.safe_dump(queues_obj, sort_keys=False)
+
+            if self.dry_run:
+                logger.info(
+                    "[dry-run] would update YuniKorn %s/%s for %s by %d node(s): "
+                    "MAX vcore %s->%s memory %s->%s; GUAR vcore %s->%s memory %s->%s",
+                    self.cm_ns, self.cm_name, queue_path, nodes,
+                    old_v_max, new_v_max, old_m_max_str, new_m_max_str,
+                    old_v_g, gr["vcore"], old_m_g_str, gr["memory"],
+                )
+                return
+
+            # Patch only data["queues.yaml"], carrying the resourceVersion from
+            # the read. Two things follow from that. The write is narrow: no
+            # other key, label or annotation on the ConfigMap is sent, so an
+            # unrelated field added between our read and write survives. And the
+            # resourceVersion acts as a precondition, so a concurrent write to
+            # queues.yaml turns into a 409 we retry against fresh data instead of
+            # a silent lost update.
+            #
+            # The whole queues.yaml *string* is still rewritten every time. That
+            # is unavoidable: YuniKorn keeps its entire config in one opaque
+            # value, and no patch type can reach inside it.
+            body = {
+                "metadata": {"resourceVersion": cm.metadata.resource_version},
+                "data": {"queues.yaml": new_text},
+            }
+            try:
+                self.v1.patch_namespaced_config_map(self.cm_name, self.cm_ns, body)
+                break
+            except ApiException as e:
+                if e.status == 409 and attempt < WRITE_ATTEMPTS:
+                    logger.warning(
+                        "Conflict writing %s/%s (attempt %d/%d); retrying against fresh copy",
+                        self.cm_ns, self.cm_name, attempt, WRITE_ATTEMPTS,
+                    )
+                    time.sleep(0.5 * attempt)
+                    continue
+                raise
 
         logger.info(
             "Updated YuniKorn %s/%s for %s by %d node(s): "
@@ -514,8 +713,7 @@ class DynamicNodeManager:
         DISCOVERY_TIMEOUT = 180
         DISCOVERY_POLL = 2
 
-        env = os.environ.copy()
-        env["KUBECONFIG"] = os.environ.get("KUBECONFIG", os.path.expanduser("~/.kube/config"))
+        env = self._subprocess_env()
 
         try:
             before_nodes = {n.metadata.name for n in self.v1.list_node().items}
@@ -541,20 +739,30 @@ class DynamicNodeManager:
 
         logger.info("convert_node_to_k8s: converting %d node(s) for ns=%s queue=%s", nodes_to_convert, namespace, queue_path)
 
+        cmd = [
+            self.node_convert_path,
+            "--set",
+            "k8s",
+            "--node-type",
+            self.node_type,
+            "--num-nodes",
+            str(nodes_to_convert),
+            "--namespace",
+            namespace,
+        ]
+        if self.allow_preempt:
+            cmd.append("--allow-preempt")
+
+        if self.dry_run:
+            logger.info("[dry-run] would run: %s", " ".join(cmd))
+            logger.info(
+                "[dry-run] would then increase capacity for %s by up to %d node(s)",
+                queue_path,
+                nodes_to_convert,
+            )
+            return []
+
         try:
-            cmd = [
-                "/usr/site/rcac/sbin/node-convert",
-                "--set",
-                "k8s",
-                "--node-type",
-                "a",
-                "--num-nodes",
-                str(nodes_to_convert),
-                "--namespace",
-                namespace,
-            ]
-            if self.allow_preempt:
-                cmd.append("--allow-preempt")
             logger.info("Running: %s", " ".join(cmd))
             p = subprocess.Popen(
                 cmd,
@@ -579,7 +787,14 @@ class DynamicNodeManager:
         while time.time() < deadline and len(discovered) < nodes_to_convert:
             try:
                 current = {n.metadata.name for n in self.v1.list_node().items}
-                diff = list(current - before_nodes)
+                # Only claim nodes of the type this instance asked for. On a
+                # shared cluster another manager may convert a node during this
+                # window, and an unfiltered set-difference would adopt it.
+                diff = [
+                    name
+                    for name in (current - before_nodes)
+                    if not self.node_type or name.startswith(self.node_type)
+                ]
                 if diff:
                     discovered = diff[:nodes_to_convert]
                     if len(discovered) >= nodes_to_convert:
@@ -600,6 +815,7 @@ class DynamicNodeManager:
             self.converted_nodes[node_name] = {
                 "namespace": namespace,
                 "last_pod_end": datetime.utcnow().isoformat(),
+                "owner": self.instance_id,
             }
         self.save_converted_nodes()
 
@@ -620,11 +836,18 @@ class DynamicNodeManager:
         DISCOVERY_TIMEOUT = 180
         DISCOVERY_POLL = 2
 
-        env = os.environ.copy()
-        env["KUBECONFIG"] = os.environ.get("KUBECONFIG", os.path.expanduser("~/.kube/config"))
+        env = self._subprocess_env()
+
+        cmd = [self.node_convert_path, "--set", "batch", "--node-name", node_name]
+
+        if self.dry_run:
+            logger.info("[dry-run] would run: %s", " ".join(cmd))
+            logger.info(
+                "[dry-run] would then decrease capacity for %s by 1 node", queue_path
+            )
+            return False
 
         try:
-            cmd = ["/usr/site/rcac/sbin/node-convert", "--set", "batch", "--node-name", node_name]
             logger.info("Running: %s", " ".join(cmd))
 
             p = subprocess.Popen(
@@ -689,6 +912,17 @@ class DynamicNodeManager:
         now = datetime.utcnow()
 
         for node, info in list(self.converted_nodes.items()):
+            # Entries written before ownership tracking have no owner; treat
+            # those as ours so an upgraded production instance keeps managing
+            # the nodes it already converted.
+            owner = info.get("owner", self.instance_id)
+            if owner != self.instance_id:
+                logger.info(
+                    "Node %s is owned by instance '%s', not '%s'; leaving it alone.",
+                    node, owner, self.instance_id,
+                )
+                continue
+
             ns = info.get("namespace")
             if not ns:
                 logger.warning("Node %s has no recorded namespace; skipping namespace-scoped check.", node)
@@ -730,10 +964,17 @@ class DynamicNodeManager:
 
             queue_path = self.namespace_queue_paths.get(ns)
             if not queue_path:
-                logger.warning("No queue path for namespace %s; cannot adjust capacity on revert.", ns)
+                # Previously this fell back to "root", which cannot be resolved
+                # by _find_queue and left the node reverted in Slurm but stuck
+                # in the registry forever.
+                logger.error(
+                    "No queue path for namespace %s; refusing to revert %s "
+                    "because the capacity decrease cannot be applied.", ns, node,
+                )
+                continue
 
             logger.info("Node %s idle for %ss (>= threshold). Reverting.", node, idle)
-            if self.revert_node_to_slurm(node, queue_path or "root"):
+            if self.revert_node_to_slurm(node, queue_path):
                 del self.converted_nodes[node]
                 self.save_converted_nodes()
             else:
@@ -1051,9 +1292,27 @@ if __name__ == "__main__":
     parser.add_argument("--namespace", help="Namespace for test load")
     parser.add_argument("--queue", help="Queue path for test load")
     parser.add_argument("--replicas", type=int, default=50, help="Replicas for test load")
+    parser.add_argument(
+        "--config",
+        default=None,
+        help=(
+            "Path to the ini config. Defaults to $DNM_CONFIG, then "
+            f"{DEFAULT_CONFIG_PATH}. Use this to run a validation instance "
+            "with its own state, queue allowlist and node type."
+        ),
+    )
+    parser.add_argument(
+        "--dry-run",
+        action="store_true",
+        help=(
+            "Evaluate normally and log every node-convert invocation and "
+            "YuniKorn capacity change that would be made, without executing "
+            "or writing anything."
+        ),
+    )
     args = parser.parse_args()
 
-    mgr = DynamicNodeManager()
+    mgr = DynamicNodeManager(config_path=args.config, dry_run=args.dry_run)
 
     if args.mode == "monitor":
         mgr.monitor()
