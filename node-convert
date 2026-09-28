@@ -9,7 +9,8 @@ NODE_TYPE=""
 NUM_NODES=""
 NAMESPACE=""
 LIST_ONLY=0
-SET_K8S="/usr/site/rcac/sbin/k8s-convert"
+# k8s-convert needs to run as root
+SET_K8S="sudo -n /usr/site/rcac/sbin/k8s-convert"
 MARK_REASON="${MARK_REASON:-batch node selected for k8s conversion}"
 
 # Discover default search domain for FQDN pings (may be empty)
