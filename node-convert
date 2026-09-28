@@ -16,7 +16,12 @@ MARK_REASON="${MARK_REASON:-batch node selected for k8s conversion}"
 # Discover default search domain for FQDN pings (may be empty)
 NODE_SEARCH_DOMAIN="${NODE_SEARCH_DOMAIN:-$(hostname -d 2>/dev/null || true)}"
 
-RES_NAME="k8s"
+# Reservation holding every node this program has converted -- the only thing
+# stopping Slurm scheduling batch work onto a node that is running Kubernetes.
+# Overridable because res_add_nodes/res_remove_nodes rewrite the member list
+# with no locking, so two instances sharing one reservation drop each other's
+# nodes out of it. ':-' so an exported-but-empty value still falls back.
+RES_NAME="${RES_NAME:-k8s}"
 RES_USERS="root"
 RES_ACCOUNTS="root"
 
@@ -93,6 +98,10 @@ Usage: $0 --set <k8s|batch> [--node-name <name> | (--node-type a|b|g --num-nodes
     --help        This message
 
 Environment overrides (both modes):
+    RES_NAME                 Slurm reservation holding converted nodes
+                             (default k8s). Two instances running at once must
+                             use different names, or they drop each other's
+                             nodes out of the shared reservation.
     MIN_IDLE_SECONDS         Minimum idle time before a node is viable (default 600)
     RES_LOOKAHEAD_SECONDS    Treat reservations starting within this window as
                              blocking (default 86400)
@@ -1232,7 +1241,10 @@ case $CONVERT_TO in
                 # half converted. They stay reserved and drained (out of Slurm's
                 # reach) on purpose; check the pdsh output above to see which
                 # failed.
-                echo "Node(s) ${reachable[*]} remain drained and in reservation ${RES_NAME}. Inspect them, then run '${PROG} --set batch --node-name <node>' on any that did not convert." >&2
+                # RES_NAME spelled out: pasted into a plain root shell the
+                # command would otherwise default to a reservation this
+                # invocation never touched.
+                echo "Node(s) ${reachable[*]} remain drained and in reservation ${RES_NAME}. Inspect them, then run 'RES_NAME=${RES_NAME} ${PROG} --set batch --node-name <node>' on any that did not convert." >&2
                 exit $rc
             fi
             for node in "${reachable[@]}"; do
@@ -1287,7 +1299,8 @@ case $CONVERT_TO in
             pdsh -w "$NODE_NAME" "env NAMESPACE='${NAMESPACE}' $SET_K8S" || rc=$?
             if (( rc != 0 )); then
                 echo "pdsh failed with rc=$rc for $NODE_NAME" >&2
-                echo "$NODE_NAME remains drained and in reservation ${RES_NAME}. Inspect it, then run '${PROG} --set batch --node-name ${NODE_NAME}' to hand it back to Slurm." >&2
+                # RES_NAME spelled out; see the note on the multi-node path.
+                echo "$NODE_NAME remains drained and in reservation ${RES_NAME}. Inspect it, then run 'RES_NAME=${RES_NAME} ${PROG} --set batch --node-name ${NODE_NAME}' to hand it back to Slurm." >&2
                 exit $rc
             fi
 

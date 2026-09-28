@@ -368,6 +368,14 @@ class DynamicNodeManager:
         self.node_type = str(
             config_data.get("settings", "node_type", fallback="a")
         ).strip()
+        # Slurm reservation node-convert keeps its converted nodes in, passed
+        # down as RES_NAME. Empty means "leave node-convert's own default
+        # alone", which is what production wants. A second instance must set
+        # it: node-convert maintains the reservation by read-modify-write with
+        # no locking, so two instances sharing one drop each other's nodes.
+        self.slurm_reservation_name = str(
+            config_data.get("settings", "slurm_reservation_name", fallback="")
+        ).strip()
         self.converted_nodes = self.load_converted_nodes()
         self.node_vcores = int(config_data.get("settings", "node_cpu_capacity", fallback="128"))
         self.node_mem_bytes = self._parse_mem(
@@ -443,11 +451,14 @@ class DynamicNodeManager:
 
         logger.info(
             "Instance '%s' starting: config=%s state=%s node_type=%s "
-            "queues=%s cm=%s/%s dry_run=%s max_converted=%d",
+            "reservation=%s queues=%s cm=%s/%s dry_run=%s max_converted=%d",
             self.instance_id,
             self.config_path,
             self.converted_nodes_path,
             self.node_type,
+            # Not guessing "k8s" here: this process genuinely does not know
+            # the name when the key is unset.
+            self.slurm_reservation_name or "<node-convert default>",
             self.allowed_queue_prefixes or "<unrestricted>",
             self.cm_ns,
             self.cm_name,
@@ -466,6 +477,19 @@ class DynamicNodeManager:
             env["KUBECONFIG"] = os.environ.get(
                 "KUBECONFIG", os.path.expanduser("~/.kube/config")
             )
+
+        # Which Slurm reservation node-convert adds to and removes from. Set
+        # here so the convert and revert paths cannot disagree -- a revert
+        # under the wrong name silently leaves the node in the reservation
+        # that actually holds it.
+        #
+        # Unset deletes any inherited RES_NAME rather than passing it through:
+        # which shared reservation a root daemon rewrites should come from its
+        # config file, not from the environment it was started in.
+        if self.slurm_reservation_name:
+            env["RES_NAME"] = self.slurm_reservation_name
+        else:
+            env.pop("RES_NAME", None)
         return env
 
     # True if queue_path falls inside one of the permitted subtrees.
