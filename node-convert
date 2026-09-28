@@ -175,6 +175,15 @@ expand_hostlist() {
     if [[ -z "$hl" || "$hl" == "(null)" || "$hl" == "N/A" ]]; then
         return 0
     fi
+    # A hostlist with no bracket and no comma is a single hostname and is its own
+    # expansion. Worth the special case: scontrol re-reads and parses slurm.conf
+    # on every start, and this is by far the most common shape here -- the
+    # preemptible workload is single-node by construction, and most SchedNodes
+    # plans name one node.
+    if [[ "$hl" != *[\[,]* ]]; then
+        printf '%s\n' "$hl"
+        return 0
+    fi
     if ! out="$(/usr/bin/scontrol show hostnames "$hl" 2>&1)"; then
         warn "WARN: could not expand hostlist '${hl}': ${out}"
         return 1
@@ -387,11 +396,15 @@ planned_nodes() {
         return 1
     fi
 
+    # use awk here to reduce node-convert runtime
+    #
+    # squeue pads SchedNodes out to the full 2000-char field width, and bash's
+    # read builtin takes one read(2) syscall per byte on a pipe. Feeding a busy
+    # queue straight into 'while read' costs seconds in syscalls alone, so awk
+    # (which buffers) strips the padding first and drops the jobs with no plan.
     printf '%s\n' "$raw" \
-      | while read -r jid hl _; do
-            if [[ -z "${hl:-}" || "$hl" == "(null)" || "$hl" == "N/A" ]]; then
-                continue
-            fi
+      | awk 'NF >= 2 && $2 != "(null)" && $2 != "N/A" { print $1, $2 }' \
+      | while read -r jid hl; do
             while read -r n; do
                 [[ -n "$n" ]] && printf '%s %s\n' "$n" "$jid"
             done < <(expand_hostlist "$hl" || true)
@@ -411,8 +424,20 @@ reserved_nodes() {
         return 1
     fi
 
+    # thanks claude for speedup
     printf '%s\n' "$raw" \
-      | awk '
+      | awk -v now="$now" -v horizon="$horizon" -v resname="$RES_NAME" '
+          # Slurm prints times as local-time ISO ("2026-09-24T13:42:01"), or as
+          # Unknown/(null). mktime reads them in process; date(1) per reservation
+          # was two forks each. mktime resolves DST itself, which is why the
+          # string is handed over whole rather than offset by hand.
+          function to_epoch(v, dflt,   spec, ep) {
+              if (v !~ /^[0-9]/) return dflt
+              spec = v
+              gsub(/[-T:]/, " ", spec)
+              ep = mktime(spec)
+              return (ep > 0) ? ep : dflt
+          }
           {
             delete f
             n = split($0, t, " ")
@@ -424,18 +449,15 @@ reserved_nodes() {
                 }
             }
             if (f["ReservationName"] == "" || f["Nodes"] == "" || f["Nodes"] == "(null)") next
-            print f["ReservationName"] "|" f["StartTime"] "|" f["EndTime"] "|" f["Nodes"]
+            if (f["ReservationName"] == resname) next
+            # A reservation whose dates cannot be read keeps blocking its nodes:
+            # started long ago, ends far away. Failing the other way would let an
+            # undateable reservation quietly stop protecting anything.
+            if (to_epoch(f["EndTime"], 9999999999) < now + 0) next
+            if (to_epoch(f["StartTime"], 0) > horizon + 0) next
+            print f["ReservationName"] "|" f["Nodes"]
           }' \
-      | while IFS='|' read -r name start end nodes; do
-            if [[ "$name" == "$RES_NAME" ]]; then
-                continue
-            fi
-            local s e
-            s="$(date -d "$start" +%s 2>/dev/null || echo 0)"
-            e="$(date -d "$end" +%s 2>/dev/null || echo 9999999999)"
-            if (( e < now )) || (( s > horizon )); then
-                continue
-            fi
+      | while IFS='|' read -r name nodes; do
             while read -r n; do
                 [[ -n "$n" ]] && printf '%s %s\n' "$n" "$name"
             done < <(expand_hostlist "$nodes" || true)
@@ -456,25 +478,23 @@ preemptible_jobs() {
         return 1
     fi
 
+    # As in planned_nodes: NodeList is padded to 2000 chars, so the parsing and
+    # the StartTime arithmetic both happen in awk rather than in a bash loop that
+    # forks date(1) once per job.
     printf '%s\n' "$raw" \
-      | while read -r jid nn st nl _; do
-            if [[ -z "${nl:-}" || "$nl" == "(null)" || "$nl" == "N/A" ]]; then
-                continue
-            fi
-            local start elapsed
-            start="$(date -d "$st" +%s 2>/dev/null || echo 0)"
-            if (( start == 0 )); then
-                continue
-            fi
-            elapsed=$(( now - start ))
-            if (( elapsed < 0 )); then
-                elapsed=0
-            fi
-            if (( PREEMPT_MAX_RUNTIME_SECONDS > 0 && elapsed > PREEMPT_MAX_RUNTIME_SECONDS )); then
-                continue
-            fi
-            printf '%s|%s|%s|%s\n' "$elapsed" "$jid" "$nn" "$nl"
-        done \
+      | awk -v now="$now" -v maxrt="$PREEMPT_MAX_RUNTIME_SECONDS" '
+          NF >= 4 && $4 != "(null)" && $4 != "N/A" {
+              spec = $3
+              gsub(/[-T:]/, " ", spec)
+              start = mktime(spec)
+              # Unparseable StartTime is skipped, as an unreadable job age must
+              # not read as "brand new" and get preempted first.
+              if (start <= 0) next
+              elapsed = now + 0 - start
+              if (elapsed < 0) elapsed = 0
+              if (maxrt + 0 > 0 && elapsed > maxrt + 0) next
+              print elapsed "|" $1 "|" $2 "|" $4
+          }' \
       | sort -t'|' -k1,1n
 }
 
@@ -491,7 +511,7 @@ preemptible_node_map() {
     fi
     while IFS='|' read -r elapsed jid nn nl; do
         [[ -n "${jid:-}" ]] || continue
-        human="$(fmt_duration "$elapsed")"
+        fmt_duration "$elapsed" human
         while read -r n; do
             [[ -n "$n" ]] && printf '%s %s %s %s\n' "$n" "$jid" "$human" "$nn"
         done < <(expand_hostlist "$nl" || true)
@@ -567,7 +587,7 @@ node_report() {
     printf '%s\n' "$nodes_raw" \
       | awk -v prefix="$prefix" -v planned="$planned_file" -v reserved="$reserved_file" \
             -v preempt="$preempt_file" -v puser="$PREEMPT_USER" -v pacct="$PREEMPT_ACCOUNT" \
-            -v bad="$EXCLUDE_STATE_FLAGS" '
+            -v bad="$EXCLUDE_STATE_FLAGS" -v now="$now" -v minidle="$MIN_IDLE_SECONDS" '
           BEGIN {
             while ((getline line < planned) > 0)  { split(line, a, " "); if (a[1] != "") pjob[a[1]] = a[2] }
             while ((getline line < reserved) > 0) { split(line, a, " "); if (a[1] != "") pres[a[1]] = a[2] }
@@ -616,31 +636,25 @@ node_report() {
                 verdict = "SKIP"; reason = "reservation " pres[name]
             }
 
+            # LastBusyTime is "Unknown" or local-time ISO. Judging it here rather
+            # than in a bash loop below is the difference between one process and
+            # two forks per node: on a thousand-node cluster that loop was
+            # several seconds of date(1) startup and nothing else.
             lb = f["LastBusyTime"]
-            if (lb == "") lb = "Unknown"
-            print name "|" state "|" lb "|" verdict "|" reason
-          }' \
-      | while IFS='|' read -r name state lb verdict reason; do
-            local lb_epoch age
-            if [[ "$lb" == "Unknown" || -z "$lb" ]]; then
-                # No timestamp to judge by; assume it just crossed the threshold.
-                age="$MIN_IDLE_SECONDS"
-            else
-                lb_epoch="$(date -d "$lb" +%s 2>/dev/null || echo 0)"
-                if (( lb_epoch == 0 )); then
-                    age="$MIN_IDLE_SECONDS"
-                else
-                    age=$(( now - lb_epoch ))
-                fi
-            fi
-            if (( age < 0 )); then
-                age=0
-            fi
-            if [[ "$verdict" == "OK" ]] && (( age < MIN_IDLE_SECONDS )); then
-                verdict="SKIP"; reason="idle only ${age}s (< ${MIN_IDLE_SECONDS}s)"
-            fi
-            printf '%s|%s|%s|%s|%s\n' "$name" "$state" "$age" "$verdict" "$reason"
-        done
+            # No timestamp to judge by: assume it just crossed the threshold.
+            age = minidle + 0
+            if (lb ~ /^[0-9]/) {
+                spec = lb
+                gsub(/[-T:]/, " ", spec)
+                ep = mktime(spec)
+                if (ep > 0) age = now + 0 - ep
+            }
+            if (age < 0) age = 0
+            if (verdict == "OK" && age < minidle + 0) {
+                verdict = "SKIP"; reason = "idle only " age "s (< " minidle "s)"
+            }
+            print name "|" state "|" age "|" verdict "|" reason
+          }'
 }
 
 # Prints eligible node names, longest-idle first. Fails if the report does.
@@ -847,8 +861,9 @@ list_viable_nodes() {
         printf '%s\n' "$report" \
           | sort -t'|' -k4,4 -k3,3nr \
           | while IFS='|' read -r name state age verdict reason; do
+                fmt_duration "$age" age_h
                 printf '%-16s %-24s %12s  %-7s %s\n' \
-                    "$name" "$state" "$(fmt_duration "$age")" "$verdict" "$reason"
+                    "$name" "$state" "$age_h" "$verdict" "$reason"
             done
     fi
 
@@ -886,16 +901,26 @@ list_viable_nodes() {
 
 # Renders a second count as e.g. "2d3h" / "45m". No spaces: the result is also
 # embedded in the reason column.
+#
+# With a second argument the result is written to the variable of that name
+# instead of stdout. Callers in per-node loops must use that form: "$(...)" forks
+# a subshell for every row, which on a thousand-node --list is a second of pure
+# fork overhead for a string format.
 fmt_duration() {
-    local s="${1:-0}"
-    if (( s >= 86400 )); then
-        printf '%dd%dh' $(( s / 86400 )) $(( (s % 86400) / 3600 ))
-    elif (( s >= 3600 )); then
-        printf '%dh%dm' $(( s / 3600 )) $(( (s % 3600) / 60 ))
-    elif (( s >= 60 )); then
-        printf '%dm' $(( s / 60 ))
+    local __fd_s="${1:-0}" __fd_out
+    if (( __fd_s >= 86400 )); then
+        printf -v __fd_out '%dd%dh' $(( __fd_s / 86400 )) $(( (__fd_s % 86400) / 3600 ))
+    elif (( __fd_s >= 3600 )); then
+        printf -v __fd_out '%dh%dm' $(( __fd_s / 3600 )) $(( (__fd_s % 3600) / 60 ))
+    elif (( __fd_s >= 60 )); then
+        printf -v __fd_out '%dm' $(( __fd_s / 60 ))
     else
-        printf '%ds' "$s"
+        printf -v __fd_out '%ds' "$__fd_s"
+    fi
+    if [[ -n "${2:-}" ]]; then
+        printf -v "$2" '%s' "$__fd_out"
+    else
+        printf '%s' "$__fd_out"
     fi
 }
 
@@ -1035,6 +1060,14 @@ if [[ -n "$NAMESPACE" && ! "$NAMESPACE" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]]; then
 fi
 
 require_cmd /usr/bin/scontrol /usr/bin/squeue awk sort date mktemp
+
+# The node report converts Slurm's timestamps with awk's mktime() rather than
+# forking date(1) once per node. mktime() is a GNU awk extension, so check for it
+# by name here: without this, an awk that lacks it fails mid-report with a syntax
+# error, which surfaces as "could not build the node report" and hides the cause.
+if ! awk 'BEGIN { if (mktime("2000 01 01 00 00 00") <= 0) exit 1 }' >/dev/null 2>&1; then
+    die "this awk has no mktime(); install gawk (the node report needs it to read Slurm timestamps)"
+fi
 
 # Read-only inspection mode: report and exit before any validation or mutation.
 if (( LIST_ONLY )); then
