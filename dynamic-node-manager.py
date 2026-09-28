@@ -17,7 +17,8 @@ from kubernetes.client import AppsV1Api
 import random
 import string
 import math
-from threading import Thread, Lock
+import signal
+from threading import Thread, Lock, Event
 
 
 DEDICATED_NS_LABEL = "dynamic.dedicated"
@@ -27,8 +28,43 @@ DEDICATED_MARK_TAINT_VALUE = "batch"
 DEDICATED_MARK_TAINT_EFFECT = "NoSchedule"
 
 NAMESPACE_MARK_TAINT_EFFECT = "NoSchedule"
+
+# Conversion work the evaluate loop has committed to. PENDING_CONVERSIONS holds
+# tasks the actuator has not started; IN_FLIGHT holds the one it is executing.
+# Both are (namespace, queue_path) tuples and both are guarded by PENDING_LOCK.
+#
+# IN_FLIGHT exists because a conversion takes minutes -- node-convert drains the
+# node, reboots it and waits for it to register -- while the evaluate loop keeps
+# running every check_interval_seconds. Demand is measured from YuniKorn's
+# queue capacity, which does not move until the new node joins, so every cycle in
+# that window sees the original deficit. Without counting committed work, each
+# one enqueues the same conversion again.
 PENDING_CONVERSIONS = []
+IN_FLIGHT = []
 PENDING_LOCK = Lock()
+
+# Set by SIGINT/SIGTERM. Stops both loops from starting new work; a conversion
+# already running is allowed to finish so that it gets recorded in the registry.
+SHUTDOWN = Event()
+
+# Default ceiling on how long monitor() waits for an in-progress conversion or
+# reversion to finish after a shutdown signal. Both are node-convert (minutes)
+# plus up to DISCOVERY_TIMEOUT waiting for the node to appear or disappear, so
+# this is deliberately generous: exiting early is what orphans a node. Override
+# per instance with shutdown_grace_seconds.
+#
+# Under systemd this is only meaningful if the unit's TimeoutStopSec is at least
+# as large; otherwise systemd SIGKILLs first and the wait never completes.
+DEFAULT_SHUTDOWN_GRACE_SECONDS = 600
+
+# How long to wait for the loops to notice shutdown when nothing long-running is
+# underway. They poll the event at most every couple of seconds.
+SHUTDOWN_IDLE_TIMEOUT = 15
+
+# Fraction of a queue's configured maximum that DNM treats as usable before it
+# considers the queue under pressure. Shared by the trigger arithmetic and the
+# re-check inside convert_node_to_k8s so the two cannot disagree.
+HEADROOM = 0.95
 
 # Default locations. Every one of these can be overridden per instance so that a
 # validation instance can run alongside production without sharing state.
@@ -41,6 +77,52 @@ def truthy(value, default=False):
     if value is None:
         return default
     return str(value).strip().lower() in ("1", "true", "yes", "on")
+
+
+def request_shutdown(signum, _frame):
+    """
+    First signal asks for an orderly stop; second one forces it.
+
+    The escape hatch matters because an orderly stop can legitimately take
+    several minutes -- it waits for an in-progress conversion to finish
+    recording itself -- and someone who needs the process gone now should not
+    have to reach for SIGKILL.
+
+    This handler deliberately does NOT use logger. CPython runs Python signal
+    handlers in the main thread between bytecodes, so it can fire while that
+    same thread is inside SysLogger._emit holding the (non-reentrant) console
+    lock. Logging from here would then deadlock against a lock the interrupted
+    frame can never release -- and it would deadlock the *force* path too,
+    leaving a second Ctrl-C with no effect. os.write to fd 2 needs no lock.
+    The explanatory logging happens in monitor(), on the main thread, once
+    SHUTDOWN has been observed.
+    """
+    if SHUTDOWN.is_set():
+        try:
+            os.write(2, b"\nForced exit. A conversion may be unrecorded; "
+                        b"reconcile node-convert --list against the registry.\n")
+        except Exception:
+            pass
+        # Bypass interpreter cleanup deliberately: atexit handlers and thread
+        # joins are the very things being skipped.
+        os._exit(1)
+    SHUTDOWN.set()
+
+
+def install_shutdown_handlers():
+    """
+    Only valid in the main thread, and only where these signals exist. Failing
+    to install them must not stop the manager from running -- it just means
+    falling back to the old abrupt behaviour.
+    """
+    for signame in ("SIGINT", "SIGTERM"):
+        sig = getattr(signal, signame, None)
+        if sig is None:
+            continue
+        try:
+            signal.signal(sig, request_shutdown)
+        except (ValueError, OSError) as e:
+            logger.warning("Could not install %s handler: %s", signame, e)
 
 
 class SysLogger:
@@ -295,6 +377,15 @@ class DynamicNodeManager:
             config_data.get("settings", "global_cooldown_seconds", fallback="30")
         )
         self._next_conversion_allowed_at = 0
+        # Ceiling on the orderly-shutdown wait. Must be <= the systemd unit's
+        # TimeoutStopSec, or systemd kills the process before the wait expires.
+        self.shutdown_grace_seconds = int(
+            config_data.get(
+                "settings",
+                "shutdown_grace_seconds",
+                fallback=str(DEFAULT_SHUTDOWN_GRACE_SECONDS),
+            )
+        )
         self.default_cpu_request_m = int(
             config_data.get("settings", "default_cpu_request_m", fallback="1000")
         )
@@ -796,7 +887,6 @@ class DynamicNodeManager:
         """Convert as many nodes as needed; only bump capacity after nodes appear."""
         import time
 
-        HEADROOM = 0.95
         DISCOVERY_TIMEOUT = 180
         DISCOVERY_POLL = 2
 
@@ -1060,6 +1150,18 @@ class DynamicNodeManager:
                 )
                 continue
 
+            # A reversion is as long-running and as unsafe to interrupt as a
+            # conversion: revert_node_to_slurm decreases queue capacity, and the
+            # registry entry is only deleted once it returns. Killed in between,
+            # the node is gone from the cluster but still listed here, and the
+            # next start decreases capacity for it a second time -- a permanent
+            # shrink of a shared production queue. So start no new ones once
+            # shutdown has been requested; the one already running still
+            # finishes, because monitor() waits for this thread.
+            if SHUTDOWN.is_set():
+                logger.info("Shutdown requested; not starting reversion of %s", node)
+                break
+
             logger.info("Node %s idle for %ss (>= threshold). Reverting.", node, idle)
             if self.revert_node_to_slurm(node, queue_path):
                 del self.converted_nodes[node]
@@ -1224,11 +1326,28 @@ class DynamicNodeManager:
         """
         Evaluate all namespaces and enqueue conversion tasks into PENDING_CONVERSIONS.
         Honors the live cluster-wide cap every time it runs.
-        """
-        HEADROOM = 0.95
 
+        Headroom is measured against converted nodes that are live *plus* the
+        conversions already committed but not yet visible. get_converted_counts()
+        only sees nodes that have joined the cluster, and a conversion takes
+        minutes to get there, so counting live nodes alone makes every cycle
+        during a conversion believe nothing is being done and enqueue the work
+        again.
+        """
         total_converted, per_ns_counts = self.get_converted_counts()
-        remaining_overall = max(0, self.max_converted_nodes - total_converted)
+
+        # Snapshot both queues together so the totals are consistent with each
+        # other; the actuator moves a task from one to the other under this lock.
+        with PENDING_LOCK:
+            committed = list(PENDING_CONVERSIONS) + list(IN_FLIGHT)
+
+        committed_by_ns = {}
+        for committed_ns, _ in committed:
+            committed_by_ns[committed_ns] = committed_by_ns.get(committed_ns, 0) + 1
+
+        remaining_overall = max(
+            0, self.max_converted_nodes - total_converted - len(committed)
+        )
 
         multi_info = per_ns_counts.pop("multiple", None)
         ns_only_counts = per_ns_counts
@@ -1240,21 +1359,30 @@ class DynamicNodeManager:
                 logger.info(
                     f"Converted nodes (live): total={total_converted}, per_ns={ns_only_counts}, "
                     f"multiple={multi_count} (namespace overlaps={multi_details}), "
+                    f"committed={len(committed)}, "
                     f"max={self.max_converted_nodes}, remaining={remaining_overall}"
                 )
             else:
                 logger.info(
                     f"Converted nodes (live): total={total_converted}, per_ns={ns_only_counts}, "
                     f"multiple={multi_info}, "
+                    f"committed={len(committed)}, "
                     f"max={self.max_converted_nodes}, remaining={remaining_overall}"
                 )
         else:
             logger.info(
                 f"Converted nodes (live): total={total_converted}, per_ns={ns_only_counts}, "
+                f"committed={len(committed)}, "
                 f"max={self.max_converted_nodes}, remaining={remaining_overall}"
             )
 
         if remaining_overall <= 0:
+            if committed:
+                logger.info(
+                    f"No conversion headroom: {total_converted} live + {len(committed)} "
+                    f"committed against max={self.max_converted_nodes}. Waiting for "
+                    f"committed work to land rather than re-enqueueing it."
+                )
             return 0
 
         to_enqueue = []
@@ -1266,6 +1394,20 @@ class DynamicNodeManager:
                 continue
 
             need = self._needed_nodes_for_ns(ns, queue_path, HEADROOM)
+            if need <= 0:
+                continue
+
+            # The deficit this namespace reports does not yet reflect conversions
+            # already committed for it: queue capacity only rises once the node
+            # joins. Subtract them, or a two-minute conversion gets re-requested
+            # on every cycle until the cap absorbs it.
+            already = committed_by_ns.get(ns, 0)
+            if already:
+                logger.info(
+                    f"[{ns}] needs {need} node(s); {already} already queued or in flight "
+                    f"-> {max(0, need - already)} new"
+                )
+                need -= already
             if need <= 0:
                 continue
 
@@ -1288,65 +1430,90 @@ class DynamicNodeManager:
 
         return len(to_enqueue)
 
-    # Runs forever on a timer:
+    # Runs on a timer until shutdown:
     #   - calls trigger() to enqueue conversions
     #   - calls check_converted_nodes() to revert idle nodes
     def evaluate_loop(self):
         logger.info("Evaluate loop started")
-        while True:
+        while not SHUTDOWN.is_set():
             try:
                 self.trigger()
                 self.check_converted_nodes()
             except Exception as e:
                 logger.error(f"Evaluate loop error: {e}")
-            time.sleep(self.check_interval_seconds)
+            # Waiting on the event rather than sleeping means a shutdown signal
+            # is acted on immediately instead of after up to check_interval_seconds.
+            SHUTDOWN.wait(self.check_interval_seconds)
+        logger.info("Evaluate loop stopped")
 
-    # Runs forever:
+    # Runs until shutdown:
     #   - enforces global conversion cap
     #   - drains one task from PENDING_CONVERSIONS at a time
     #   - executes conversion (node-convert + discovery + capacity bump)
+    #
+    # A task is moved from PENDING_CONVERSIONS to IN_FLIGHT under one lock, so it
+    # is never invisible to trigger(). It stays in IN_FLIGHT until the conversion
+    # returns -- successfully or not -- which is what stops the evaluate loop
+    # re-enqueueing work that is already underway.
     def actuator_loop(self):
         logger.info("Actuator loop started")
-        while True:
+        while not SHUTDOWN.is_set():
             try:
                 total_converted, _ = self.get_converted_counts()
                 remaining_overall = max(0, self.max_converted_nodes - total_converted)
                 task = None
 
                 if remaining_overall <= 0:
-                    time.sleep(2)
+                    SHUTDOWN.wait(2)
                     continue
 
                 now = time.time()
                 if now < self._next_conversion_allowed_at:
                     wait_time = self._next_conversion_allowed_at - now
                     logger.info(f"Actuator: global cooldown active ({wait_time:.1f}s remaining). Waiting...")
-                    time.sleep(1)
+                    SHUTDOWN.wait(1)
                     continue
 
+                # Re-check under the lock. The loop condition was tested before
+                # get_converted_counts(), which is a live API call and can take
+                # seconds; a signal arriving in that window must not be able to
+                # start draining and rebooting a physical node.
                 with PENDING_LOCK:
-                    if PENDING_CONVERSIONS:
+                    if PENDING_CONVERSIONS and not SHUTDOWN.is_set():
                         task = PENDING_CONVERSIONS.pop(0)
+                        IN_FLIGHT.append(task)
 
                 if not task:
-                    time.sleep(1)
+                    SHUTDOWN.wait(1)
                     continue
 
-                ns, queue_path = task
-                logger.info(f"Actuator: converting one node for ns={ns}, queue={queue_path} (remaining cap={remaining_overall})")
-                node = self.convert_node_to_k8s(ns, queue_path)
-                if node:
-                    logger.info(f"Actuator: converted node {node} for ns={ns}")
-                else:
-                    logger.warning(f"Actuator: conversion failed for ns={ns}; will not requeue automatically")
+                try:
+                    ns, queue_path = task
+                    logger.info(f"Actuator: converting one node for ns={ns}, queue={queue_path} (remaining cap={remaining_overall})")
+                    node = self.convert_node_to_k8s(ns, queue_path)
+                    if node:
+                        logger.info(f"Actuator: converted node {node} for ns={ns}")
+                    else:
+                        logger.warning(f"Actuator: conversion failed for ns={ns}; will not requeue automatically")
+                finally:
+                    # Must happen however the conversion ended. A task left in
+                    # IN_FLIGHT would permanently consume a slot against
+                    # max_converted_nodes and stall every future conversion.
+                    with PENDING_LOCK:
+                        try:
+                            IN_FLIGHT.remove(task)
+                        except ValueError:
+                            pass
             except Exception as e:
                 logger.error(f"Actuator loop error: {e}")
-                time.sleep(2)
+                SHUTDOWN.wait(2)
+        logger.info("Actuator loop stopped")
 
     # Entry point for monitor mode:
     #   - logs basic cluster info
+    #   - installs shutdown handlers
     #   - starts evaluate + actuator threads
-    #   - keeps the main thread alive
+    #   - blocks until a shutdown signal, then drains
     def monitor(self):
         try:
             nodes = self.v1.list_node().items
@@ -1354,14 +1521,88 @@ class DynamicNodeManager:
         except ApiException as e:
             logger.error(f"Failed to retrieve nodes: {e}")
 
+        install_shutdown_handlers()
+
         logger.info("Starting service loops (evaluate + actuator)")
         t1 = Thread(target=self.evaluate_loop, name="dnm-evaluate", daemon=True)
         t2 = Thread(target=self.actuator_loop, name="dnm-actuator", daemon=True)
         t1.start()
         t2.start()
 
-        while True:
-            time.sleep(60)
+        # Poll rather than block indefinitely: a bare Event.wait() is not
+        # reliably interruptible by signals on every platform, and this loop
+        # costs nothing.
+        while not SHUTDOWN.wait(1):
+            pass
+
+        # The signal handler cannot log -- it would deadlock against the console
+        # lock -- so the explanation belongs here, on the main thread.
+        logger.warning(
+            "Shutdown requested: starting no further conversions or reversions. "
+            "Waiting for any already in progress; signal again to force an exit."
+        )
+
+        # Neither loop takes new work now. Either may still be inside
+        # node-convert, which cannot be safely interrupted: the physical node has
+        # already been drained and rebooted, and the registry write that makes
+        # the change reversible happens only after discovery. Exiting here is
+        # exactly what strands a node. So wait for both threads, not just the
+        # actuator -- a reversion is every bit as dangerous to cut in half as a
+        # conversion, and worse, resuming from a half-done reversion decreases
+        # the shared queue's capacity a second time.
+        with PENDING_LOCK:
+            in_flight = list(IN_FLIGHT)
+            dropped = len(PENDING_CONVERSIONS)
+            PENDING_CONVERSIONS.clear()
+
+        if dropped:
+            logger.info("Discarded %d queued conversion(s) that had not started", dropped)
+
+        if in_flight:
+            logger.warning(
+                "Conversion(s) in progress for %s; these must finish or the node is orphaned.",
+                ", ".join(ns for ns, _ in in_flight),
+            )
+
+        # Give the loops a moment to fall out on their own. If they do, there is
+        # nothing long-running and no reason to hold the grace budget open --
+        # which also stops an unresponsive API call from stalling shutdown for
+        # ten minutes with nothing actually in flight.
+        threads = [(t2, "actuator"), (t1, "evaluate")]
+        idle_deadline = time.time() + SHUTDOWN_IDLE_TIMEOUT
+        for th, _name in threads:
+            th.join(timeout=max(0.0, idle_deadline - time.time()))
+
+        stalled = [name for th, name in threads if th.is_alive()]
+        if stalled:
+            logger.warning(
+                "Still working (%s); waiting up to %ds more.",
+                ", ".join(stalled), self.shutdown_grace_seconds,
+            )
+            grace_deadline = time.time() + self.shutdown_grace_seconds
+            for th, _name in threads:
+                th.join(timeout=max(0.0, grace_deadline - time.time()))
+            stalled = [name for th, name in threads if th.is_alive()]
+
+        if stalled:
+            with PENDING_LOCK:
+                stuck = list(IN_FLIGHT)
+            logger.error(
+                "Gave up after %ds; %s loop(s) still running. Exiting non-zero. "
+                "In flight: %s. Reconcile `node-convert --list --node-type %s` "
+                "against %s -- a node in one and not the other is stranded, and "
+                "check %s capacity was not left doubled or halved.",
+                self.shutdown_grace_seconds,
+                ", ".join(stalled),
+                ", ".join(ns for ns, _ in stuck) or "unknown",
+                self.node_type,
+                self.converted_nodes_path,
+                ", ".join(sorted(set(self.namespace_queue_paths.values()))) or "the queue",
+            )
+            return 1
+
+        logger.info("Stopped cleanly.")
+        return 0
 
 
 # CLI entrypoint:
@@ -1415,7 +1656,10 @@ if __name__ == "__main__":
     mgr = DynamicNodeManager(config_path=args.config, dry_run=args.dry_run)
 
     if args.mode == "monitor":
-        mgr.monitor()
+        # Non-zero when shutdown gave up on a loop that was still running, so
+        # that "stopped, but something may be stranded" is distinguishable from
+        # a clean stop by anything watching the exit status.
+        sys.exit(mgr.monitor() or 0)
     elif args.mode == "test":
         if not args.namespace or not args.queue:
             parser.error("--namespace and --queue are required for test mode")
